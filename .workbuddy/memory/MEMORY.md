@@ -8,11 +8,14 @@
 core/   C++17 内核：expr.*（对偶数表达式引擎）sim.*（模拟器，含 Barnes-Hut 树）
         api.cpp（C ABI）test_main.cpp bench_main.cpp（性能基准）
 server/ core_wrap.py（ctypes）server.py（stdlib HTTP+SSE，无三方依赖）
-        verify_pages.py（两页串行验证）verify_speed_tree.py screenshot.py
+        ~~verify_*.py / smoke_test.py 等验证脚本已于 2026-10-15 删除~~
 web/    index.html（主页，Hash 2D-CAM 风格）+ three.html（三体花活页，/three.html），
         均无构建无 CDN
-bin/    gravity_core.dll（-static 全静态）、gs_test.exe、gs_bench.exe
+bin/    gravity_core.dll（-static 全静态）、gs_test.exe、gs_bench.exe（构建产物，已 gitignore）
 build.bat / build.sh / run.bat（端口 8123）
+.gitignore / .gitattributes（2026-10-15 新增）
+GitHub：https://github.com/zzl9914/Simulation-of-Gravity （public，master，
+        2026-10-15 首次推送；⚠ 未加 LICENSE）
 ```
 
 ## UI 约定（第 8 轮定版）
@@ -123,19 +126,29 @@ build.bat / build.sh / run.bat（端口 8123）
   T11 树精度/PE/冷盘积分、T14 钉住晕 5 项），全过为准。
 - `bin/gs_bench.exe`：直接 vs 树基准（`--3d`、`--direct-max`、`--steps`）。
   第 9 轮后力循环更快：N=2000 直接 22ms/步、树 1.8ms/步；N=4000 树 4.3ms/步；32k 树 57ms。
-- `server/smoke_test.py`、`server/eccentricity_test.py`（实测脚本，可复跑）。
-- `server/verify_pages.py`：两页（/ 与 /three.html）串行 headless 验证 + 截图；
-  `server/verify_g.py`：第 10 轮 G 标定 E2E（默认 G=1 / R=20→G=4 / F=r / LJ 近平衡）；
-  `server/verify_halo.py`：第 12 轮重写为**纯晕**验证（10/10：flags=1 / m 不变 /
-  |x|=|v|=0 / 体数=N+1 / 盘 L_z 非零 / 演化后不动 / 并合模式下质量不变）；
-  `server/verify_speed_tree.py`：E2E（第 12 轮修好，见下）；
-  `server/screenshot.py` 已过时（引用旧 #preset 控件）。
-  （均需 venv playwright：`...\envs\default\Scripts\python.exe`）
+
+### ⚠ 2026-10-15 订正：Python 验证脚本已全部删除
+用户要求「移除测试脚本」后按选定档位删除，以下条目**在磁盘上已不存在**，
+需要时须重写（原记录保留备查，勿再当可用工具引用）：
+- ~~`server/smoke_test.py`、`server/eccentricity_test.py`、`server/drift_test.py`~~
+- ~~`server/verify_pages.py`~~（两页 headless 冒烟 + 截图）
+- ~~`server/verify_g.py`~~（G 标定 E2E：默认 G=1 / R=20→G=4 / F=r / LJ 近平衡）
+- ~~`server/verify_halo.py`~~（纯晕验证 10/10：flags=1 / m 不变 / |x|=|v|=0 /
+  体数=N+1 / 盘 L_z 非零 / 演化后不动 / 并合模式下质量不变）
+- ~~`server/verify_speed_tree.py`~~（加速 + 树 E2E）
+- ~~`server/screenshot.py`~~（本就过时，引用第 8 轮前的 #preset 控件）
+同时删除全部 `shot_*.png`（server/ 10 个 + bin/ 11 个 + web/ 8 个）。
+**当前仓库内唯一可跑的验证是 `bin/gs_test.exe`（需先 build.bat）。**
+（脚本均需 venv playwright：`...\envs\default\Scripts\python.exe`）
+
+### 重写这些脚本时必须记住的坑
 - ⚠ 截图/联调**不能并行跑**：多个浏览器共享同一服务器模拟实例，会互相抢配置。
   第 12 轮因此误报过一次「LJ 云 drift 170%」，串行重跑即 0.1%。
 - ⚠ 写浏览器端诊断时**按 `s.n` 遍历，不要拿 `i+k < a.length` 判界**——stride 8 下
   写成 `i+2` 会读到数组外，看到一片 `undefined` 却误判成「SSE 数组有洞」。
-- `verify_speed_tree.py` 的两个时代坑（第 8 轮 UI 改抽屉后失效，第 12 轮修复）：
-  必须先 `click("#settingsToggle")` 否则 #genBtn 不可见 30s 超时；
-  **`#genN` 是 log10 刻度**（value=log10 N，范围 0.3–3.602），直接赋 2500 会被
+- 第 8 轮 UI 改成设置抽屉后：必须先 `click("#settingsToggle")`，否则 #genBtn
+  不可见 → 30s 超时。
+- **`#genN` 是 log10 刻度**（value=log10 N，范围 0.3–3.602），直接赋 2500 会被
   钳到 4000，要赋 `Math.log10(2500)`。
+- E2E 暂停要用前端 `sim.running` 判位后点 #playBtn（不是按钮文本、也不是
+  直接 POST /api/control，后者会被 applySetup 的 running:true 覆盖）。
