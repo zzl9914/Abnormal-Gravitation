@@ -1,0 +1,9 @@
+# 仓库内统一 LF，Windows 检出时转回 CRLF（build.bat / run.bat 需要）
+* text=auto
+
+*.bat text eol=crlf
+*.sh  text eol=lf
+
+*.png binary
+*.dll binary
+*.exe binary

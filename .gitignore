@@ -1,0 +1,16 @@
+# 构建产物（build.bat 生成）
+bin/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 验证脚本产出的截图
+shot_*.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
