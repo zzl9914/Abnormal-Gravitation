@@ -14,3 +14,6 @@ shot_*.png
 *.swp
 .DS_Store
 Thumbs.db
+
+# 工作区内部数据（本地记忆等，不入库）
+.workbuddy/
