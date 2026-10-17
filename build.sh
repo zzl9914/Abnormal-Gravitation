@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Build gravity_core.dll (or .so) and the physics test harness.
+# Build gravity_core.dll (or .so), the physics test harness and the benchmark.
+# wasm 构建（前端直连内核）用 web/tools/build-kernel.js（需要 clang + wasm32）。
 set -e
 cd "$(dirname "$0")"
 mkdir -p bin
 CXX=${CXX:-g++}
+SRC="core/expr.cpp core/sim.cpp core/gsmath.cpp"
 
 if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == win32 ]]; then
+  # Simulation 含固定容量数组成员（约 1MB），测试里是栈对象，Windows 上必须加大栈
   "$CXX" -O2 -std=c++17 -shared -static -static-libgcc -static-libstdc++ \
-    -o bin/gravity_core.dll core/api.cpp core/expr.cpp core/sim.cpp
+    -o bin/gravity_core.dll core/api.cpp $SRC
+  "$CXX" -O2 -std=c++17 -static-libgcc -static-libstdc++ -Wl,--stack,67108864 \
+    -o bin/gs_test.exe core/test_main.cpp $SRC
+  "$CXX" -O2 -std=c++17 -static-libgcc -static-libstdc++ -Wl,--stack,67108864 \
+    -o bin/gs_bench.exe core/bench_main.cpp $SRC
 else
-  "$CXX" -O2 -std=c++17 -shared -fPIC -o bin/gravity_core.so \
-    core/api.cpp core/expr.cpp core/sim.cpp
+  "$CXX" -O2 -std=c++17 -shared -fPIC -o bin/gravity_core.so core/api.cpp $SRC
+  "$CXX" -O2 -std=c++17 -o bin/gs_test core/test_main.cpp $SRC
+  "$CXX" -O2 -std=c++17 -o bin/gs_bench core/bench_main.cpp $SRC
 fi
-"$CXX" -O2 -std=c++17 -static-libgcc -static-libstdc++ \
-  -o bin/gs_test core/test_main.cpp core/expr.cpp core/sim.cpp
-"$CXX" -O2 -std=c++17 -static-libgcc -static-libstdc++ \
-  -o bin/gs_bench core/bench_main.cpp core/expr.cpp core/sim.cpp
 echo "Build OK. Run tests with: bin/gs_test"

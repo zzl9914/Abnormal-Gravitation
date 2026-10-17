@@ -271,6 +271,9 @@ canvas.mini{width:264px;background:var(--panel2);border:1px solid var(--line);bo
 
 <div id="errbar"></div>
 
+<!-- wasm 内核（base64 内联，由 build_wasm.bat 生成）+ 直连桥接层 -->
+<script src="gravity_wasm.js"></script>
+<script src="gravity.js"></script>
 <script>
 'use strict';
 // ============================================================== state
@@ -343,12 +346,9 @@ function curCfg(){
     bodies:initialBodies, running:sim.running
   };
 }
-async function post(path, obj){
-  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
-  return r.json();
-}
+// 直连 wasm 内核：setup/control 都是进程内函数调用（无 HTTP、无 SSE）
 async function applySetup(showOk){
-  const res=await post('/api/setup',curCfg());
+  const res=Gravity.setup(curCfg());
   const st=$('applyStatus');
   if(res.ok){
     st.textContent='已重建 ✓';st.className='status ok';
@@ -358,7 +358,7 @@ async function applySetup(showOk){
   }
   return res.ok;
 }
-async function control(obj){ return post('/api/control',obj); }
+function control(obj){ return Gravity.control(obj); }
 
 function loadScene(sc, autostart){
   curSceneName = sc.name;
@@ -374,13 +374,10 @@ function loadScene(sc, autostart){
   saveLast(sc.key);
 }
 
-// ============================================================== SSE
-let es=null;
+// ============================================================== 帧循环（直连内核）
+// 由 gravity.js 的 rAF tick 直接读 wasm 内存（零拷贝视图），取代 SSE 的 JSON 帧
 function connectStream(){
-  if(es) es.close();
-  es=new EventSource('/api/stream');
-  es.onmessage=ev=>{
-    const s=JSON.parse(ev.data);
+  Gravity.onFrame=s=>{
     sim.t=s.t; sim.n=s.n; sim.e=s.e; sim.e0=s.e0; sim.bodies=s.bodies; sim.error=s.error;
     if(s.running!==undefined && s.running!==sim.running) setPlayBtn(s.running);
     document.body.classList.toggle('is-running', !!s.running);
@@ -389,6 +386,7 @@ function connectStream(){
     pushTrails();
     energies.push(s.e); if(energies.length>300) energies.shift();
   };
+  Gravity.start();
 }
 
 // ============================================================== trails
@@ -672,7 +670,7 @@ $('editMode').onchange=()=>cv.classList.toggle('edit',$('editMode').checked);
 function setPlayBtn(running){ $('playBtn').textContent=running?'⏸ 暂停':'▶ 运行'; }
 $('playBtn').onclick=async()=>{sim.running=!sim.running;setPlayBtn(sim.running);await control({running:sim.running});};
 $('stepBtn').onclick=async()=>{sim.running=false;setPlayBtn(false);await control({running:false,stepOnce:true});};
-$('resetBtn').onclick=async()=>{const r=await post('/api/reset',{});if(r.ok){energies=[];trails.data=[];}};
+$('resetBtn').onclick=()=>{const r=Gravity.reset();if(r.ok){energies=[];trails.data=[];}};
 $('apply').onclick=()=>applySetup(true);
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;
@@ -699,18 +697,28 @@ $('monToggle').onclick=()=>{
 };
 
 // ============================================================== boot
+// ⚠ 顺序：先 setPlayBtn(true) → ready() → connectStream() → loadScene()
 renderSceneList(); renderSavedList(); renderBodyList();
 setPlayBtn(true);
-connectStream();
-let boot = SCENES[0];
-try{
-  const last=localStorage.getItem(LS_LAST);
-  const found=last && SCENES.find(s=>s.key===last);
-  if(found) boot=found;
-}catch(e){}
-loadScene(boot,true);
-setTimeout(fitView, 800);
-requestAnimationFrame(render);
+(async()=>{
+  try{
+    await Gravity.ready();
+  }catch(e){
+    $('errbar').style.display='block';
+    $('errbar').textContent='内核加载失败：'+e.message+'（先运行 build_wasm.bat）';
+    return;
+  }
+  connectStream();
+  let boot = SCENES[0];
+  try{
+    const last=localStorage.getItem(LS_LAST);
+    const found=last && SCENES.find(s=>s.key===last);
+    if(found) boot=found;
+  }catch(e){}
+  loadScene(boot,true);
+  setTimeout(fitView, 800);
+  requestAnimationFrame(render);
+})();
 </script>
 </body>
 </html>

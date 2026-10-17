@@ -303,6 +303,9 @@ canvas.mini{width:264px;background:var(--panel2);border:1px solid var(--line);bo
 
 <div id="errbar"></div>
 
+<!-- wasm 内核（base64 内联，由 build_wasm.bat 生成）+ 直连桥接层 -->
+<script src="gravity_wasm.js"></script>
+<script src="gravity.js"></script>
 <script>
 'use strict';
 // ============================================================== state
@@ -414,13 +417,10 @@ function curCfg(){
     bodies:initialBodies, running:sim.running
   };
 }
-async function post(path, obj){
-  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
-  return r.json();
-}
+// 直连 wasm 内核：没有 HTTP、没有 SSE，setup/control 都是进程内函数调用
 async function applySetup(showOk){
   const cfg=curCfg();
-  const res=await post('/api/setup',cfg);
+  const res=Gravity.setup(cfg);
   const st=$('applyStatus');
   if(res.ok){
     st.textContent='已重建 ✓';st.className='status ok';
@@ -431,13 +431,13 @@ async function applySetup(showOk){
   }
   return res.ok;
 }
-async function fetchAnalysis(){
+function fetchAnalysis(){
   try{
-    const r=await fetch('/api/analysis'); if(!r.ok) return;
-    analysis=await r.json(); drawPotential();
+    const a=Gravity.analysis(); if(!a) return;
+    analysis=a; drawPotential();
   }catch(e){}
 }
-async function control(obj){ return post('/api/control',obj); }
+function control(obj){ return Gravity.control(obj); }
 // 半半径标定：G·F(R/2)=0.04（基准 = 默认 R=10、F=1/r²、G=1），
 // 由服务器对 F 表达式实际求值，同时取回 [0.2R, 1.05R] 上 64 点的 F 采样表，
 // 供 makeCloud 按 v=√(G·mEnc·F(r)·r) 做任意力律的近平衡初始化
@@ -445,7 +445,7 @@ async function calibrateG(){
   const R=+$('genR').value;
   const rs=[]; for(let i=0;i<64;i++) rs.push(+(0.2*R*Math.pow(1.05/0.2,i/63)).toFixed(6));
   try{
-    const res=await post('/api/calibrate',{F:$('vExpr').value.trim(), r:R/2, rs});
+    const res=Gravity.calibrate({F:$('vExpr').value.trim(), r:R/2, rs});
     const g=(+res.g>0 && isFinite(+res.g)) ? +res.g : 1;
     const ft=(Array.isArray(res.fs) && res.fs.length===rs.length)
       ? {rs, fs:res.fs.map(x=>(+x>0 && isFinite(+x)) ? +x : 0)} : null;
@@ -471,13 +471,11 @@ function circV(G, mEnc, r, ft){
   return 0.6*Math.sqrt(G);
 }
 
-// ============================================================== SSE
-let es=null;
+// ============================================================== 帧循环（直连内核）
+// 旧版是 EventSource('/api/stream') 收 JSON 帧；现在由 gravity.js 的 rAF tick
+// 直接读 wasm 内存（零拷贝 Float64Array 视图），每渲染帧回调一次。
 function connectStream(){
-  if(es) es.close();
-  es=new EventSource('/api/stream');
-  es.onmessage=ev=>{
-    const s=JSON.parse(ev.data);
+  Gravity.onFrame=s=>{
     const prevN=sim.n;
     sim.t=s.t; sim.n=s.n; sim.e=s.e; sim.e0=s.e0; sim.bodies=s.bodies; sim.error=s.error;
     if(s.running!==undefined && s.running!==sim.running) setPlayBtn(s.running);
@@ -489,6 +487,7 @@ function connectStream(){
     pushTrails();
     energies.push(s.e); if(energies.length>240) energies.shift();
   };
+  Gravity.start();
 }
 
 // ============================================================== trails
@@ -747,7 +746,7 @@ function setPlayBtn(running){
 }
 $('playBtn').onclick=async()=>{sim.running=!sim.running;setPlayBtn(sim.running);await control({running:sim.running});};
 $('stepBtn').onclick=async()=>{sim.running=false;setPlayBtn(false);await control({running:false,stepOnce:true});};
-$('resetBtn').onclick=async()=>{const r=await post('/api/reset',{});if(r.ok){energies=[];trails.data=[];}};
+$('resetBtn').onclick=()=>{const r=Gravity.reset();if(r.ok){energies=[];trails.data=[];}};
 $('apply').onclick=()=>applySetup(true);
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;
@@ -825,13 +824,24 @@ $('genBtn').onclick=async()=>{
 };
 
 // ============================================================== boot
+// ⚠ 顺序：先 sim.running=true → 再 ready() → connectStream() → applySetup()
+// （以前只改按钮文字会在启动瞬间被暂停）
 sim.running=true;
 setPlayBtn(true);
-connectStream();
-initialBodies=defaultBodies();
-applySetup(false);
-setTimeout(fitView, 800);
-requestAnimationFrame(render);
+(async()=>{
+  try{
+    await Gravity.ready();
+  }catch(e){
+    $('errbar').style.display='block';
+    $('errbar').textContent='内核加载失败：'+e.message+'（先运行 build_wasm.bat）';
+    return;
+  }
+  connectStream();
+  initialBodies=defaultBodies();
+  applySetup(false);
+  setTimeout(fitView, 800);
+  requestAnimationFrame(render);
+})();
 </script>
 </body>
 </html>

@@ -1,175 +1,228 @@
 #include "sim.hpp"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <utility>
+#include "gsmath.h"
+#include "gsstr.h"
 
 namespace grav {
 
-static const double kGradClamp = 1e6;   // clamp on |d(d)/d(dx_k)|
-static const double kForceClamp = 1e12; // clamp on force scale
-static const double kPi = 3.14159265358979323846;
+static const double kGradClamp = 1e6;    // |d(d)/d(dx_k)| 钳位
+static const double kForceClamp = 1e12;  // 力幅钳位
+static const double GS_LN10 = 2.30258509299404568402;
 
-Simulation::Simulation(int dims, const std::string& fExpr, const std::string& forceExpr)
-    : dim_(dims < 1 ? 1 : dims), f_(fExpr, "t"), F_(forceExpr, "r") {
+// ------------------------------------------------- 共享静态工作缓冲
+// freestanding 下没有 new；树节点 / 溢出槽位 / 接触对都用固定容量的静态数组。
+// 同一时刻只有一个树在活动（computeAccel / energy / collectContacts 每次重建），
+// 因此共享是安全的。
+
+static TreeNode g_nodes[kMaxNodes];
+static int g_nodeCount = 0;
+static int g_root = -1;
+
+static int g_extraBody[kMaxExtra];
+static int g_extraNext[kMaxExtra];
+static int g_extraUsed = 0;
+
+static int g_cA[kMaxContacts];
+static int g_cB[kMaxContacts];
+static int g_cN = 0;
+
+// 溢出链表：头插，返回新的头索引
+static int extraAlloc(int body, int head) {
+    if (g_extraUsed >= kMaxExtra) return head;  // 满了就丢弃（极罕见）
+    int idx = g_extraUsed++;
+    g_extraBody[idx] = body;
+    g_extraNext[idx] = head;
+    return idx;
+}
+
+// ------------------------------------------------------------------ 构造
+
+bool Simulation::init(int dims, const char* fExpr, const char* forceExpr) {
+    // 语义默认值（静态实例靠 .bss 清零，这里显式设置）
+    dim_ = dims < 1 ? 1 : dims;
+    collisionMode_ = Collision::Pass;
+    density_ = 100.0;
+    G_ = 1.0;
+    treeMode_ = 0;
+    theta_ = 0.6;
+    t_ = 0.0;
+    nbodies_ = 0;
+    accValid_ = false;
+    nPow_ = 0;
+    vLn_ = 0.0;
+    vAnalytic_ = false;
+    fIsPower_ = false;
+    fExp_ = 1.0;
+    ok_ = false;
+    err_[0] = '\0';
+
     if (dim_ > 8) {
-        err_ = "内核最多支持 8 维（前端只开放 2D/3D）";
-        return;
+        gs_strcat(err_, kMaxErr, "内核最多支持 8 维（前端只开放 2D/3D）");
+        return false;
     }
-    if (!f_.ok()) {
-        err_ = "f(t) 表达式错误: " + f_.error();
-        return;
+    if (!fExpr || !forceExpr) {
+        gs_strcat(err_, kMaxErr, "表达式为空");
+        return false;
     }
-    if (!F_.ok()) {
-        err_ = "F(r) 表达式错误: " + F_.error();
-        return;
+    if (!f_.compile(fExpr, "t")) {
+        gs_strcat(err_, kMaxErr, "f(t) 表达式错误: ");
+        gs_strcat(err_, kMaxErr, f_.error());
+        return false;
     }
-    // Force law sanity: must be finite at a few probe distances.  (A pole
-    // elsewhere, e.g. F = 1/(r-1), is handled by the runtime clamps.)
-    for (double r : {0.5, 1.0, 2.0}) {
-        if (!std::isfinite(F_.value(r))) {
-            err_ = "F(r) 在 r = " + std::to_string(r) + " 处不是有限值";
-            return;
+    if (!F_.compile(forceExpr, "r")) {
+        gs_strcat(err_, kMaxErr, "F(r) 表达式错误: ");
+        gs_strcat(err_, kMaxErr, F_.error());
+        return false;
+    }
+    // 力律体检：几个探测距离上必须是有限值（其余极点交给运行时钳位）
+    static const double kProbe[3] = {0.5, 1.0, 2.0};
+    for (int i = 0; i < 3; i++) {
+        if (!gs_isfinite(F_.value(kProbe[i]))) {
+            gs_strcat(err_, kMaxErr, "F(r) 在 r = ");
+            gs_strcat_num(err_, kMaxErr, kProbe[i]);
+            gs_strcat(err_, kMaxErr, " 处不是有限值");
+            return false;
         }
     }
 
     double p = 0.0;
     if (f_.asPowerOfVar(p)) {
-        if (!(p > 0.0) || !std::isfinite(p)) {
-            err_ = "f(t) = t^p 要求 p > 0 才能求逆";
-            return;
+        if (!(p > 0.0) || !gs_isfinite(p)) {
+            gs_strcat(err_, kMaxErr, "f(t) = t^p 要求 p > 0 才能求逆");
+            return false;
         }
         fIsPower_ = true;
         fExp_ = p;
     } else {
-        // Validate: f(0) == 0 and f strictly increasing on a sampled grid.
-        if (std::fabs(f_.value(0.0)) > 1e-9) {
-            err_ = "f 必须满足 f(0) = 0（否则两点重合时距离不为 0）";
-            return;
+        // 校验：f(0) == 0 且在采样网格上严格递增
+        if (gs_fabs(f_.value(0.0)) > 1e-9) {
+            gs_strcat(err_, kMaxErr, "f 必须满足 f(0) = 0（否则两点重合时距离不为 0）");
+            return false;
         }
         double prev = 0.0;
         for (int i = 0; i < 80; i++) {
-            double t = std::pow(10.0, -6.0 + 10.0 * i / 79.0);  // 1e-6 .. 1e4
+            double t = gs_exp(-6.0 * GS_LN10 + 10.0 * GS_LN10 * i / 79.0);  // 1e-6 .. 1e4
             double v = f_.value(t);
-            if (!std::isfinite(v)) {
-                err_ = "f 在 t = " + std::to_string(t) + " 处不是有限值";
-                return;
+            if (!gs_isfinite(v)) {
+                gs_strcat(err_, kMaxErr, "f 在 t = ");
+                gs_strcat_num(err_, kMaxErr, t);
+                gs_strcat(err_, kMaxErr, " 处不是有限值");
+                return false;
             }
-            if (!(v > prev)) {  // strict increase
-                err_ = "f 必须在 [0, +inf) 上严格递增（在 t = " + std::to_string(t) + " 附近不满足）";
-                return;
+            if (!(v > prev)) {  // 严格递增
+                gs_strcat(err_, kMaxErr, "f 必须在 [0, +inf) 上严格递增（在 t = ");
+                gs_strcat_num(err_, kMaxErr, t);
+                gs_strcat(err_, kMaxErr, " 附近不满足）");
+                return false;
             }
             prev = v;
         }
     }
 
-    // Derive the potential V(r) = integral of F dr  (so that V' = F).
-    std::vector<std::pair<double, double>> terms;  // F = sum a_i r^{p_i}
-    if (F_.asPowerSum(terms)) {
-        vAnalytic_ = true;  // exact antiderivative
-        for (const auto& tm : terms) {
-            double pp = tm.first, a = tm.second;
+    // 派生势 V(r) = ∫F dr（V' = F）
+    double tp[kMaxPowTermsSim], ta[kMaxPowTermsSim];
+    int nt = 0;
+    if (F_.asPowerSum(tp, ta, kMaxPowTermsSim, nt)) {
+        vAnalytic_ = true;  // 精确原函数
+        nPow_ = 0;
+        vLn_ = 0.0;
+        for (int i = 0; i < nt; i++) {
+            double pp = tp[i], a = ta[i];
             if (pp == -1.0) {
-                vLn_ += a;                      // int r^-1 = ln r
-            } else {
-                vPow_.push_back({pp + 1.0, a / (pp + 1.0)});
+                vLn_ += a;  // ∫ r^-1 = ln r
+            } else if (nPow_ < kMaxPowTermsSim) {
+                vPowP_[nPow_] = pp + 1.0;
+                vPowA_[nPow_] = a / (pp + 1.0);
+                nPow_++;
             }
         }
     } else {
-        buildPotentialTable();                  // numeric quadrature
+        buildPotentialTable();  // 数值积分
     }
     ok_ = true;
+    return true;
 }
 
-// ------------------------------------------------- derived potential V
+// -------------------------------------------------------- 派生势 V
 
-// Numeric fallback: V sampled on a log grid over [1e-6, 1e6], integrated
-// with 4-point Gauss-Legendre per segment in log space (dr = r dln r).
-// Interpolation is cubic Hermite in ln r with the exact slope dV/dln r =
-// F(r)*r at the nodes; outside the grid V is extended linearly with the
-// end slope F.
+// 数值兜底：V 在 [1e-6, 1e6] 的对数网格上采样，每段用 4 点 Gauss-Legendre
+// 在 ln 空间积分（dr = r·dln r）；插值用 ln r 上的三次 Hermite，节点斜率取
+// 精确值 dV/dln r = F(r)·r；网格外用端点斜率线性外推。
 void Simulation::buildPotentialTable() {
-    const int N = 4096;
-    const double lmin = std::log(1e-6), lmax = std::log(1e6);
+    const int N = kTabN;
     static const double xg[4] = {-0.8611363115940526, -0.3399810435848563,
                                  0.3399810435848563, 0.8611363115940526};
     static const double wg[4] = {0.34785484513745385, 0.6521451548625461,
                                  0.6521451548625461, 0.34785484513745385};
-    vTabR_.assign(N, 0.0);
-    vTabV_.assign(N, 0.0);
-    vTabF_.assign(N, 0.0);
-    const double dl = (lmax - lmin) / (N - 1);
+    const double lmin = -6.0 * GS_LN10;  // ln(1e-6)
+    const double dl = (12.0 * GS_LN10) / (N - 1);
     double V = 0.0;
     for (int i = 0; i < N; i++) {
         double l = lmin + dl * i;
-        double r = std::exp(l);
+        double r = gs_exp(l);
         double fr = F_.value(r);
         vTabR_[i] = r;
         vTabV_[i] = V;
-        vTabF_[i] = std::isfinite(fr) ? fr : 0.0;
+        vTabF_[i] = gs_isfinite(fr) ? fr : 0.0;
         if (i + 1 < N) {
             double lm = l + 0.5 * dl;
             double seg = 0.0;
             for (int g = 0; g < 4; g++) {
                 double lg = lm + 0.5 * dl * xg[g];
-                double rg = std::exp(lg);
+                double rg = gs_exp(lg);
                 double fg = F_.value(rg);
-                if (std::isfinite(fg)) seg += wg[g] * 0.5 * dl * fg * rg;
+                if (gs_isfinite(fg)) seg += wg[g] * 0.5 * dl * fg * rg;
             }
             V += seg;
-            if (!std::isfinite(V)) V = V > 0 ? 1e300 : -1e300;
-            if (std::fabs(V) > 1e300) V = V > 0 ? 1e300 : -1e300;
+            if (!gs_isfinite(V)) V = V > 0 ? 1e300 : -1e300;
+            if (gs_fabs(V) > 1e300) V = V > 0 ? 1e300 : -1e300;
         }
     }
 }
 
 double Simulation::potentialAt(double r) const {
-    if (!(r > 0.0) || !std::isfinite(r)) return 0.0;
+    if (!(r > 0.0) || !gs_isfinite(r)) return 0.0;
     double v;
     if (vAnalytic_) {
-        v = vLn_ * std::log(r);
-        for (const auto& tm : vPow_) v += tm.second * std::pow(r, tm.first);
+        v = vLn_ * gs_log(r);
+        for (int i = 0; i < nPow_; i++) v += vPowA_[i] * gs_pow(r, vPowP_[i]);
     } else {
-        const int N = (int)vTabR_.size();
-        if (N < 2) return 0.0;
-        const double lmin = std::log(vTabR_[0]);
-        const double dl = std::log(vTabR_[1]) - lmin;
-        const double lr = std::log(r);
-        if (lr <= lmin) {  // below the grid: linear with the first slope
+        const int N = kTabN;
+        const double lmin = gs_log(vTabR_[0]);
+        const double dl = gs_log(vTabR_[1]) - lmin;
+        const double lr = gs_log(r);
+        if (lr <= lmin) {  // 网格下方：按首端斜率线性外推
             v = vTabV_[0] + vTabF_[0] * (r - vTabR_[0]);
         } else {
             const double lmax = lmin + dl * (N - 1);
-            if (lr >= lmax) {  // above the grid: linear with the last slope
+            if (lr >= lmax) {  // 网格上方：按末端斜率线性外推
                 v = vTabV_[N - 1] + vTabF_[N - 1] * (r - vTabR_[N - 1]);
             } else {
                 double fi = (lr - lmin) / dl;
                 int i = (int)fi;
                 if (i > N - 2) i = N - 2;
                 double u = fi - i;
-                // cubic Hermite with slopes dV/dln r = F(r) * r
+                // 三次 Hermite，斜率 dV/dln r = F(r)·r
                 double s0 = vTabF_[i] * vTabR_[i];
                 double s1 = vTabF_[i + 1] * vTabR_[i + 1];
                 double h00 = (1 + 2 * u) * (1 - u) * (1 - u);
                 double h10 = u * (1 - u) * (1 - u);
                 double h01 = u * u * (3 - 2 * u);
                 double h11 = u * u * (u - 1);
-                v = h00 * vTabV_[i] + h10 * dl * s0 + h01 * vTabV_[i + 1] + h11 * dl * s1;
+                v = h00 * vTabV_[i] + h10 * dl * s0 + h01 * vTabV_[i + 1] +
+                    h11 * dl * s1;
             }
         }
     }
-    v = G_ * v;  // coupling constant scales the derived potential
-    return std::isfinite(v) ? v : 0.0;
+    v = G_ * v;  // 耦合常数同样缩放派生势
+    return gs_isfinite(v) ? v : 0.0;
 }
 
-double Simulation::forceAt(double r) const { return F_.value(r); }
-
-// Pair potential at metric distance d with core radius R = R_i + R_j.
-// Inside the core the quadratic matches W(R) = V(R), W'(R) = G*F(R).
+// 度量距离 d 处的对势，含核内正则（R = R_i + R_j）
 double Simulation::pairV(double d, double R) const {
     if (R > 0.0 && d < R) {
         double FR = G_ * F_.value(R);
-        if (!std::isfinite(FR)) FR = 0.0;
+        if (!gs_isfinite(FR)) FR = 0.0;
         return potentialAt(R) + FR * (d * d - R * R) / (2.0 * R);
     }
     return potentialAt(d);
@@ -178,22 +231,22 @@ double Simulation::pairV(double d, double R) const {
 void Simulation::setCollision(Collision mode, double density) {
     collisionMode_ = mode;
     density_ = density > 1e-12 ? density : 1e-12;
-    // density changes body radii
-    for (auto& b : bodies_) b.radius = radiusFromMass(b.mass);
+    for (int i = 0; i < nbodies_; i++)  // 密度变了半径要重算
+        bodies_[i].radius = radiusFromMass(bodies_[i].mass);
 }
 
 void Simulation::setG(double G) {
-    if (G > 0.0 && std::isfinite(G)) G_ = G;
+    if (G > 0.0 && gs_isfinite(G)) G_ = G;
 }
 
 double Simulation::radiusFromMass(double m) const {
-    // R = ( m * Gamma(d/2+1) / (rho * pi^(d/2)) )^(1/d)
+    // R = ( m·Γ(d/2+1) / (ρ·π^(d/2)) )^(1/d)
     if (!(m > 0.0)) return 0.0;
-    double g = std::tgamma(dim_ / 2.0 + 1.0);
-    return std::pow(m * g / (density_ * std::pow(kPi, dim_ / 2.0)), 1.0 / dim_);
+    double g = gs_tgamma(dim_ / 2.0 + 1.0);
+    return gs_pow(m * g / (density_ * gs_pow(GS_PI, dim_ / 2.0)), 1.0 / dim_);
 }
 
-// ---------------------------------------------------------- Barnes-Hut tree
+// ---------------------------------------------------------- Barnes-Hut 树
 
 void Simulation::setTree(int treeMode, double theta) {
     treeMode_ = (treeMode == 1) ? 1 : 0;
@@ -202,96 +255,112 @@ void Simulation::setTree(int treeMode, double theta) {
 
 bool Simulation::treeActive() const {
     if (treeMode_ != 0) return false;
-    int alive = 0;
-    for (const auto& b : bodies_)
-        if (b.alive) alive++;
-    return alive >= kTreeThreshold;
+    return aliveCount() >= kTreeThreshold;
 }
 
 int Simulation::newNode(int parent, const double* ctr, const double* half) const {
-    TreeNode nd;
+    if (g_nodeCount >= kMaxNodes) return -1;  // 节点耗尽：调用方退化成 bucket
+    TreeNode& nd = g_nodes[g_nodeCount];
     nd.parent = parent;
-    for (int a = 0; a < dim_; a++) {
+    nd.mass = 0.0;
+    nd.mrad = 0.0;
+    nd.maxRad = 0.0;
+    nd.body = -1;
+    nd.extra = -1;
+    nd.state = 0;
+    for (int a = 0; a < 8; a++) {
+        nd.child[a] = -1;
+        nd.com[a] = 0.0;
         nd.ctr[a] = ctr[a];
         nd.half[a] = half[a];
     }
-    nodes_.push_back(std::move(nd));
-    return (int)nodes_.size() - 1;
+    return g_nodeCount++;
 }
 
 void Simulation::insertBody(int ni, int b, int depth) const {
-    uint8_t st = nodes_[ni].state;
-    if (st == 0) {  // empty cell
-        nodes_[ni].state = 1;
-        nodes_[ni].body = b;
+    uint8_t st = g_nodes[ni].state;
+    if (st == 0) {  // 空单元
+        g_nodes[ni].state = 1;
+        g_nodes[ni].body = b;
         return;
     }
-    if (st == 3) {  // depth-capped bucket
-        nodes_[ni].extra.push_back(b);
+    if (st == 3) {  // 深度封顶的 bucket
+        g_nodes[ni].extra = extraAlloc(b, g_nodes[ni].extra);
         return;
     }
-    if (st == 1) {  // occupied leaf -> subdivide
+    if (st == 1) {  // 被占用的叶 → 细分
         if (depth >= kMaxDepth) {
-            nodes_[ni].state = 3;
-            nodes_[ni].extra.push_back(b);
+            g_nodes[ni].state = 3;
+            g_nodes[ni].extra = extraAlloc(b, g_nodes[ni].extra);
             return;
         }
-        int old = nodes_[ni].body;
-        nodes_[ni].body = -1;
-        nodes_[ni].state = 2;
+        int old = g_nodes[ni].body;
+        g_nodes[ni].body = -1;
+        g_nodes[ni].state = 2;
         insertBody(ni, old, depth + 1);
         insertBody(ni, b, depth + 1);
         return;
     }
-    // internal: descend into the child cell containing the body
+    // 内部节点：下沉到包含该天体的子单元
     int k = 0;
     for (int a = 0; a < dim_; a++)
-        if (bodies_[b].pos[a] >= nodes_[ni].ctr[a]) k |= (1 << a);
-    int c = nodes_[ni].child[k];
+        if (bodies_[b].pos[a] >= g_nodes[ni].ctr[a]) k |= (1 << a);
+    int c = g_nodes[ni].child[k];
     if (c < 0) {
         double ctr[8], half[8];
         for (int a = 0; a < dim_; a++) {
-            double h2 = nodes_[ni].half[a] * 0.5;
-            ctr[a] = nodes_[ni].ctr[a] + (((k >> a) & 1) ? h2 : -h2);
+            double h2 = g_nodes[ni].half[a] * 0.5;
+            ctr[a] = g_nodes[ni].ctr[a] + (((k >> a) & 1) ? h2 : -h2);
             half[a] = h2;
         }
         c = newNode(ni, ctr, half);
-        nodes_[ni].child[k] = c;
+        if (c < 0) {  // 节点耗尽：退化成 bucket（力仍精确，只是失去剪枝）
+            g_nodes[ni].state = 3;
+            g_nodes[ni].extra = extraAlloc(b, g_nodes[ni].extra);
+            return;
+        }
+        g_nodes[ni].child[k] = c;
     }
     insertBody(c, b, depth + 1);
 }
 
 void Simulation::buildTree() const {
-    nodes_.clear();
-    root_ = -1;
+    g_nodeCount = 0;
+    g_root = -1;
+    g_extraUsed = 0;
     double mn[8], mx[8];
-    for (int k = 0; k < dim_; k++) { mn[k] = INFINITY; mx[k] = -INFINITY; }
-    for (const auto& b : bodies_) {
+    for (int k = 0; k < dim_; k++) {
+        mn[k] = __builtin_inf();
+        mx[k] = -__builtin_inf();
+    }
+    bool any = false;
+    for (int i = 0; i < nbodies_; i++) {
+        const Body& b = bodies_[i];
         if (!b.alive) continue;
+        any = true;
         for (int k = 0; k < dim_; k++) {
-            mn[k] = std::min(mn[k], b.pos[k]);
-            mx[k] = std::max(mx[k], b.pos[k]);
+            mn[k] = gs_min2(mn[k], b.pos[k]);
+            mx[k] = gs_max2(mx[k], b.pos[k]);
         }
     }
-    if (!std::isfinite(mn[0])) return;  // no alive bodies
+    if (!any) return;
     double ctr[8], half[8];
     for (int k = 0; k < dim_; k++) {
         ctr[k] = 0.5 * (mn[k] + mx[k]);
         half[k] = 0.5 * (mx[k] - mn[k]) * 1.000001 + 1e-12;
         if (!(half[k] > 0)) half[k] = 1e-6;
     }
-    root_ = newNode(-1, ctr, half);
-    for (int i = 0; i < (int)bodies_.size(); i++)
-        if (bodies_[i].alive) insertBody(root_, i, 0);
+    g_root = newNode(-1, ctr, half);
+    if (g_root < 0) return;
+    for (int i = 0; i < nbodies_; i++)
+        if (bodies_[i].alive) insertBody(g_root, i, 0);
 
-    // Bottom-up: mass / centre of mass / max radius.
-    // Children always have higher indices than their parent, so a reverse
-    // sweep finalises children before their contributions reach the parent.
-    // INVARIANT: during the sweep nd.com holds the RAW WEIGHTED SUM
-    // sum(pos_j * m_j) over the subtree (not the average).  Each node pushes
-    // that raw sum to its parent as-is; the final pass divides by mass.
-    for (int n = (int)nodes_.size() - 1; n >= 0; n--) {
-        TreeNode& nd = nodes_[n];
+    // 自底向上：质量 / 质心 / 最大半径。
+    // 子节点索引恒大于父节点，所以倒序遍历保证「子先于父结算」。
+    // ⚠ 不变量：扫过程中 nd.com 保存的是**原始加权和** Σ(pos·m)，不是质心；
+    //   父子之间原样相加，最后一趟才统一除以质量。
+    for (int n = g_nodeCount - 1; n >= 0; n--) {
+        TreeNode& nd = g_nodes[n];
         if (nd.state == 1) {
             const Body& b = bodies_[nd.body];
             nd.mass = b.mass;
@@ -299,31 +368,37 @@ void Simulation::buildTree() const {
             nd.maxRad = b.radius;
         } else if (nd.state == 3) {
             double m = 0.0;
-            double c[8] = {0};
-            auto add = [&](int j) {
-                const Body& b = bodies_[j];
+            double c[8];
+            for (int k = 0; k < 8; k++) c[k] = 0.0;
+            for (int e = nd.extra; e >= 0; e = g_extraNext[e]) {
+                const Body& b = bodies_[g_extraBody[e]];
                 m += b.mass;
                 for (int k = 0; k < dim_; k++) c[k] += b.pos[k] * b.mass;
-                nd.maxRad = std::max(nd.maxRad, b.radius);
-            };
-            if (nd.body >= 0) add(nd.body);
-            for (int j : nd.extra) add(j);
+                nd.maxRad = gs_max2(nd.maxRad, b.radius);
+            }
+            if (nd.body >= 0) {
+                const Body& b = bodies_[nd.body];
+                m += b.mass;
+                for (int k = 0; k < dim_; k++) c[k] += b.pos[k] * b.mass;
+                nd.maxRad = gs_max2(nd.maxRad, b.radius);
+            }
             nd.mass = m;
             for (int k = 0; k < dim_; k++) nd.com[k] = c[k];
         }
-        if (n != root_ && nd.mass > 0) {
-            TreeNode& p = nodes_[nd.parent];
+        if (n != g_root && nd.mass > 0) {
+            TreeNode& p = g_nodes[nd.parent];
             for (int k = 0; k < dim_; k++) p.com[k] += nd.com[k];
             p.mass += nd.mass;
-            p.maxRad = std::max(p.maxRad, nd.maxRad);
-        } else if (n != root_) {
-            TreeNode& p = nodes_[nd.parent];
-            p.maxRad = std::max(p.maxRad, nd.maxRad);
+            p.maxRad = gs_max2(p.maxRad, nd.maxRad);
+        } else if (n != g_root) {
+            TreeNode& p = g_nodes[nd.parent];
+            p.maxRad = gs_max2(p.maxRad, nd.maxRad);
         }
     }
-    // Finalise: divide accumulated com sums, compute metric radius bounds.
+    // 收尾：加权和除以质量得到质心；计算度量半径界 mrad
     const int nc = 1 << dim_;
-    for (auto& nd : nodes_) {
+    for (int i = 0; i < g_nodeCount; i++) {
+        TreeNode& nd = g_nodes[i];
         if (nd.mass > 0) {
             for (int k = 0; k < dim_; k++) nd.com[k] /= nd.mass;
         } else {
@@ -331,21 +406,20 @@ void Simulation::buildTree() const {
         }
         double mr = 0.0;
         for (int c = 0; c < nc; c++) {
-            double dd[8] = {0};
+            double dd[8];
             for (int k = 0; k < dim_; k++)
-                dd[k] = (nd.ctr[k] + (((c >> k) & 1) ? nd.half[k] : -nd.half[k])) - nd.com[k];
-            mr = std::max(mr, metricDistance(dd));
+                dd[k] = (nd.ctr[k] + (((c >> k) & 1) ? nd.half[k] : -nd.half[k])) -
+                        nd.com[k];
+            mr = gs_max2(mr, metricDistance(dd));
         }
         nd.mrad = mr;
     }
 }
 
-// Exact lower bound of the metric distance from xi to any point of the cell.
-// Valid for the whole separable family d = F(sum f(|dx_k|)): the objective
-// sum f(|dx_k|) is minimised by minimising each |dx_k| independently, i.e. by
-// clamping to the axis intervals.
+// 点 xi 到盒内任意点的度量距离**精确下界**。
+// 对可分离族 d = F(Σ f(|dx_k|))，目标 Σ f(|dx_k|) 各轴独立最小，即逐轴 clamp。
 double Simulation::minMetricDistToBox(const double* xi, const TreeNode& nd) const {
-    double dd[8] = {0};
+    double dd[8];
     for (int k = 0; k < dim_; k++) {
         double lo = nd.ctr[k] - nd.half[k], hi = nd.ctr[k] + nd.half[k];
         double t = xi[k] < lo ? lo : (xi[k] > hi ? hi : xi[k]);
@@ -354,9 +428,9 @@ double Simulation::minMetricDistToBox(const double* xi, const TreeNode& nd) cons
     return metricDistance(dd);
 }
 
-// Central pair force: F > 0 pulls body i TOWARDS the source at posj.
-//   a_i += m_j * s * (posj - x_i) / |posj - x_i|
-// with s = F(d) outside the core, F(R)*d/R inside (linear regularisation).
+// 中心力：F > 0 把 i 拉向 posj 处的源。
+//   a_i += m_j · s · (posj − x_i)/|posj − x_i|
+//   s = F(d)（核外）或 F(R)·d/R（核内线性正则）
 void Simulation::applyOneSided(int i, const double* posj, double mj, double radj) {
     double delta[8];
     double rho2 = 0.0;
@@ -364,10 +438,10 @@ void Simulation::applyOneSided(int i, const double* posj, double mj, double radj
         delta[k] = posj[k] - bodies_[i].pos[k];
         rho2 += delta[k] * delta[k];
     }
-    if (!(rho2 > 0.0)) return;  // coincident: no direction, zero force
-    if (bodies_[i].fixed) return;  // pinned: exerts force, receives none
+    if (!(rho2 > 0.0)) return;      // 重合：没有方向，力为 0
+    if (bodies_[i].fixed) return;   // 钉住天体施力但不受力
     double d = metricDistance(delta);
-    if (!(d > 0.0) || !std::isfinite(d)) return;
+    if (!(d > 0.0) || !gs_isfinite(d)) return;
     const double Rij = bodies_[i].radius + radj;
     double s;
     if (Rij > 0.0 && d < Rij) {
@@ -375,53 +449,54 @@ void Simulation::applyOneSided(int i, const double* posj, double mj, double radj
     } else {
         s = G_ * F_.value(d);
     }
-    if (!std::isfinite(s)) return;
-    if (std::fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
+    if (!gs_isfinite(s)) return;
+    if (gs_fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
     if (s == 0.0) return;
-    const double w = s / std::sqrt(rho2);  // s per unit Euclidean length
-    for (int k = 0; k < dim_; k++)
-        bodies_[i].acc[k] += mj * w * delta[k];
+    const double w = s / gs_sqrt(rho2);  // 每单位欧氏长度的力
+    for (int k = 0; k < dim_; k++) bodies_[i].acc[k] += mj * w * delta[k];
 }
 
 double Simulation::pairUOneSided(int i, const double* posj, double mj, double radj) const {
     double delta[8];
     for (int k = 0; k < dim_; k++) delta[k] = posj[k] - bodies_[i].pos[k];
     double d = metricDistance(delta);
-    if (!std::isfinite(d)) return 0.0;
+    if (!gs_isfinite(d)) return 0.0;
     const double Rij = bodies_[i].radius + radj;
     double val = pairV(d, Rij);
-    if (!std::isfinite(val)) return 0.0;
+    if (!gs_isfinite(val)) return 0.0;
     return bodies_[i].mass * mj * val;
 }
 
 void Simulation::treeForce() {
-    for (auto& b : bodies_) std::fill(b.acc.begin(), b.acc.end(), 0.0);
-    if (root_ < 0) return;
+    for (int i = 0; i < nbodies_; i++)
+        for (int k = 0; k < dim_; k++) bodies_[i].acc[k] = 0.0;
+    if (g_root < 0) return;
     int stack[512];
     const int nc = 1 << dim_;
-    for (int i = 0; i < (int)bodies_.size(); i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
-        if (bodies_[i].fixed) continue;  // pinned: no force of its own
+        if (bodies_[i].fixed) continue;  // 钉住天体没有属于自己的力
         double xi[8];
         for (int k = 0; k < dim_; k++) xi[k] = bodies_[i].pos[k];
         int sp = 0;
-        stack[sp++] = root_;
+        stack[sp++] = g_root;
         while (sp > 0) {
             int ni = stack[--sp];
-            const TreeNode& nd = nodes_[ni];
+            const TreeNode& nd = g_nodes[ni];
             if (nd.mass <= 0.0) continue;
             if (nd.state == 1) {
                 if (nd.body != i)
-                    applyOneSided(i, bodies_[nd.body].pos.data(), bodies_[nd.body].mass,
+                    applyOneSided(i, bodies_[nd.body].pos, bodies_[nd.body].mass,
                                   bodies_[nd.body].radius);
             } else if (nd.state == 3) {
                 if (nd.body >= 0 && nd.body != i)
-                    applyOneSided(i, bodies_[nd.body].pos.data(), bodies_[nd.body].mass,
+                    applyOneSided(i, bodies_[nd.body].pos, bodies_[nd.body].mass,
                                   bodies_[nd.body].radius);
-                for (int j : nd.extra)
+                for (int e = nd.extra; e >= 0; e = g_extraNext[e]) {
+                    int j = g_extraBody[e];
                     if (j != i)
-                        applyOneSided(i, bodies_[j].pos.data(), bodies_[j].mass,
-                                      bodies_[j].radius);
+                        applyOneSided(i, bodies_[j].pos, bodies_[j].mass, bodies_[j].radius);
+                }
             } else {
                 double delta[8];
                 for (int k = 0; k < dim_; k++) delta[k] = nd.com[k] - xi[k];
@@ -431,7 +506,7 @@ void Simulation::treeForce() {
                 } else {
                     for (int k = 0; k < nc; k++) {
                         int c = nd.child[k];
-                        if (c >= 0 && nodes_[c].mass > 0 && sp < 511) stack[sp++] = c;
+                        if (c >= 0 && g_nodes[c].mass > 0 && sp < 511) stack[sp++] = c;
                     }
                 }
             }
@@ -440,37 +515,38 @@ void Simulation::treeForce() {
 }
 
 double Simulation::treePotential() const {
-    if (root_ < 0) return 0.0;
-    // Potential tolerates a far tighter opening criterion than force:
-    // at theta_PE = 0.25 the estimator error is ~0.3% (vs -7% at 0.6),
-    // and PE is computed once per frame, not once per substep.
-    const double thPE = std::min(theta_, 0.25);
+    if (g_root < 0) return 0.0;
+    // 势能容忍比力更紧的开角判据：θ_PE = 0.25 时估计误差 ~0.3%
+    // （θ = 0.6 时约 −7%）；PE 每帧只算一次，力每子步都算。
+    const double thPE = gs_min2(theta_, 0.25);
     double U = 0.0;
     int stack[512];
     const int nc = 1 << dim_;
-    for (int i = 0; i < (int)bodies_.size(); i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
         double xi[8];
         for (int k = 0; k < dim_; k++) xi[k] = bodies_[i].pos[k];
         double Ui = 0.0;
         int sp = 0;
-        stack[sp++] = root_;
+        stack[sp++] = g_root;
         while (sp > 0) {
             int ni = stack[--sp];
-            const TreeNode& nd = nodes_[ni];
+            const TreeNode& nd = g_nodes[ni];
             if (nd.mass <= 0.0) continue;
             if (nd.state == 1) {
                 if (nd.body != i)
-                    Ui += pairUOneSided(i, bodies_[nd.body].pos.data(), bodies_[nd.body].mass,
+                    Ui += pairUOneSided(i, bodies_[nd.body].pos, bodies_[nd.body].mass,
                                         bodies_[nd.body].radius);
             } else if (nd.state == 3) {
                 if (nd.body >= 0 && nd.body != i)
-                    Ui += pairUOneSided(i, bodies_[nd.body].pos.data(), bodies_[nd.body].mass,
+                    Ui += pairUOneSided(i, bodies_[nd.body].pos, bodies_[nd.body].mass,
                                         bodies_[nd.body].radius);
-                for (int j : nd.extra)
+                for (int e = nd.extra; e >= 0; e = g_extraNext[e]) {
+                    int j = g_extraBody[e];
                     if (j != i)
-                        Ui += pairUOneSided(i, bodies_[j].pos.data(), bodies_[j].mass,
+                        Ui += pairUOneSided(i, bodies_[j].pos, bodies_[j].mass,
                                             bodies_[j].radius);
+                }
             } else {
                 double delta[8];
                 for (int k = 0; k < dim_; k++) delta[k] = nd.com[k] - xi[k];
@@ -480,7 +556,7 @@ double Simulation::treePotential() const {
                 } else {
                     for (int k = 0; k < nc; k++) {
                         int c = nd.child[k];
-                        if (c >= 0 && nodes_[c].mass > 0 && sp < 511) stack[sp++] = c;
+                        if (c >= 0 && g_nodes[c].mass > 0 && sp < 511) stack[sp++] = c;
                     }
                 }
             }
@@ -490,75 +566,99 @@ double Simulation::treePotential() const {
     return 0.5 * U;
 }
 
-void Simulation::collectContacts(std::vector<std::pair<int, int>>& out) const {
-    if (root_ < 0) return;
+void Simulation::collectContacts() const {
+    g_cN = 0;
+    if (g_root < 0) return;
     int stack[512];
     const int nc = 1 << dim_;
-    for (int i = 0; i < (int)bodies_.size(); i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
         const double Ri = bodies_[i].radius;
         double xi[8];
         for (int k = 0; k < dim_; k++) xi[k] = bodies_[i].pos[k];
         int sp = 0;
-        stack[sp++] = root_;
+        stack[sp++] = g_root;
         while (sp > 0) {
             int ni = stack[--sp];
-            const TreeNode& nd = nodes_[ni];
+            const TreeNode& nd = g_nodes[ni];
             if (nd.mass <= 0.0) continue;
             if (nd.state == 1 || nd.state == 3) {
-                auto test = [&](int j) {
-                    if (j <= i || !bodies_[j].alive) return;
-                    double delta[8];
-                    for (int k = 0; k < dim_; k++) delta[k] = bodies_[j].pos[k] - xi[k];
-                    double d = metricDistance(delta);
-                    double Rij = Ri + bodies_[j].radius;
-                    if (std::isfinite(d) && d <= Rij) out.emplace_back(i, j);
-                };
-                if (nd.state == 1) test(nd.body);
-                else {
-                    if (nd.body >= 0) test(nd.body);
-                    for (int j : nd.extra) test(j);
+                // 叶：只测 nd.body；bucket：先测 extra 链表，再测 nd.body
+                if (nd.state == 3) {
+                    for (int e = nd.extra; e >= 0 && g_cN < kMaxContacts;
+                         e = g_extraNext[e]) {
+                        int j = g_extraBody[e];
+                        if (j <= i || !bodies_[j].alive) continue;
+                        double delta[8];
+                        for (int k = 0; k < dim_; k++)
+                            delta[k] = bodies_[j].pos[k] - xi[k];
+                        double d = metricDistance(delta);
+                        if (gs_isfinite(d) && d <= Ri + bodies_[j].radius) {
+                            g_cA[g_cN] = i;
+                            g_cB[g_cN] = j;
+                            g_cN++;
+                        }
+                    }
+                }
+                if (nd.body >= 0 && g_cN < kMaxContacts) {
+                    int j = nd.body;
+                    if (j > i && bodies_[j].alive) {
+                        double delta[8];
+                        for (int k = 0; k < dim_; k++)
+                            delta[k] = bodies_[j].pos[k] - xi[k];
+                        double d = metricDistance(delta);
+                        if (gs_isfinite(d) && d <= Ri + bodies_[j].radius) {
+                            g_cA[g_cN] = i;
+                            g_cB[g_cN] = j;
+                            g_cN++;
+                        }
+                    }
                 }
             } else {
-                if (minMetricDistToBox(xi, nd) > Ri + nd.maxRad) continue;  // prune
+                if (minMetricDistToBox(xi, nd) > Ri + nd.maxRad) continue;  // 精确剪枝
                 for (int k = 0; k < nc; k++) {
                     int c = nd.child[k];
-                    if (c >= 0 && nodes_[c].mass > 0 && sp < 511) stack[sp++] = c;
+                    if (c >= 0 && g_nodes[c].mass > 0 && sp < 511) stack[sp++] = c;
                 }
             }
         }
     }
 }
 
+// -------------------------------------------------------------------- 天体
+
 int Simulation::addBody(double mass, const double* pos, const double* vel, bool fixed) {
-    if (!ok_ || mass <= 0 || !std::isfinite(mass)) return -1;
-    Body b;
+    if (!ok_ || mass <= 0 || !gs_isfinite(mass)) return -1;
+    if (nbodies_ >= kMaxBodies) return -1;
+    Body& b = bodies_[nbodies_];
     b.mass = mass;
     b.radius = radiusFromMass(mass);
-    b.pos.assign(pos, pos + dim_);
-    b.vel.assign(vel, vel + dim_);
-    b.acc.assign(dim_, 0.0);
+    b.alive = true;
     b.fixed = fixed;
-    if (fixed) std::fill(b.vel.begin(), b.vel.end(), 0.0);  // pinned: no motion
-    for (double x : b.pos) if (!std::isfinite(x)) return -1;
-    for (double x : b.vel) if (!std::isfinite(x)) return -1;
-    bodies_.push_back(std::move(b));
+    for (int k = 0; k < dim_; k++) {
+        b.pos[k] = pos[k];
+        b.vel[k] = fixed ? 0.0 : vel[k];
+        b.acc[k] = 0.0;
+        if (!gs_isfinite(b.pos[k])) return -1;
+        if (!gs_isfinite(b.vel[k])) return -1;
+    }
+    nbodies_++;
     accValid_ = false;
-    return (int)bodies_.size() - 1;
+    return nbodies_ - 1;
 }
 
 void Simulation::clearBodies() {
-    bodies_.clear();
+    nbodies_ = 0;
     t_ = 0.0;
     accValid_ = false;
 }
 
-// ------------------------------------------------------------ metric kernel
+// -------------------------------------------------------------- 度量核
 
-// Solve f(x) = S for x >= 0. f is strictly increasing.
+// 解 f(x) = S（x >= 0），f 严格递增
 double Simulation::invertF(double S) const {
     if (!(S > 0.0)) return 0.0;
-    if (fIsPower_) return std::pow(S, 1.0 / fExp_);
+    if (fIsPower_) return gs_pow(S, 1.0 / fExp_);
 
     double lo = 0.0, hi = 1.0;
     double fhi = f_.value(hi);
@@ -567,18 +667,19 @@ double Simulation::invertF(double S) const {
         lo = hi;
         hi *= 2.0;
         fhi = f_.value(hi);
-        if (++expand > 200) return hi;  // bounded f: distance effectively unbounded
+        if (++expand > 200) return hi;  // f 有界：距离视为无界
     }
     if (f_.value(lo) > S) return 0.0;
 
-    // Safeguarded Newton (derivative from dual eval).
+    // 带保护的 Newton（导数来自对偶数求值）
     double x = 0.5 * (lo + hi);
     for (int it = 0; it < 80; it++) {
         Dual fx = f_.eval(x);
-        if (!std::isfinite(fx.v)) break;
-        if (std::fabs(fx.v - S) <= 1e-14 * std::max(1.0, S)) return x;
-        if (fx.v < S) lo = x; else hi = x;
-        if (hi - lo <= 1e-15 * std::max(1.0, hi)) return 0.5 * (lo + hi);
+        if (!gs_isfinite(fx.v)) break;
+        if (gs_fabs(fx.v - S) <= 1e-14 * gs_max2(1.0, S)) return x;
+        if (fx.v < S) lo = x;
+        else hi = x;
+        if (hi - lo <= 1e-15 * gs_max2(1.0, hi)) return 0.5 * (lo + hi);
         double xn;
         if (fx.d > 1e-300) xn = x - (fx.v - S) / fx.d;
         else xn = 0.5 * (lo + hi);
@@ -592,11 +693,11 @@ double Simulation::metricDistance(const double* delta) const {
     if (fIsPower_) {
         const double p = fExp_;
         double S = 0.0;
-        for (int k = 0; k < dim_; k++) S += std::pow(std::fabs(delta[k]), p);
-        return S > 0.0 ? std::pow(S, 1.0 / p) : 0.0;
+        for (int k = 0; k < dim_; k++) S += gs_pow(gs_fabs(delta[k]), p);
+        return S > 0.0 ? gs_pow(S, 1.0 / p) : 0.0;
     }
     double S = 0.0;
-    for (int k = 0; k < dim_; k++) S += f_.value(std::fabs(delta[k]));
+    for (int k = 0; k < dim_; k++) S += f_.value(gs_fabs(delta[k]));
     return invertF(S);
 }
 
@@ -605,51 +706,49 @@ bool Simulation::pairKernel(const double* delta, double& dOut, double* grad) con
     if (fIsPower_) {
         const double p = fExp_;
         double S = 0.0;
-        for (int k = 0; k < dim_; k++) {
-            double e = std::fabs(delta[k]);
-            S += std::pow(e, p);
-        }
-        d = S > 0.0 ? std::pow(S, 1.0 / p) : 0.0;
-        if (!(d > 0.0) || !std::isfinite(d)) {
+        for (int k = 0; k < dim_; k++) S += gs_pow(gs_fabs(delta[k]), p);
+        d = S > 0.0 ? gs_pow(S, 1.0 / p) : 0.0;
+        if (!(d > 0.0) || !gs_isfinite(d)) {
             dOut = d > 0 ? d : 0.0;
             for (int k = 0; k < dim_; k++) grad[k] = 0.0;
-            return d > 0.0 && std::isfinite(d);
+            return d > 0.0 && gs_isfinite(d);
         }
-        // grad[k] = (|dx_k| / d)^(p-1) * sgn(dx_k)
+        // grad[k] = (|dx_k|/d)^(p−1) · sgn(dx_k)
         for (int k = 0; k < dim_; k++) {
-            double ratio = std::fabs(delta[k]) / d;  // in [0,1]
-            double g = std::pow(ratio, p - 1.0);
-            if (!std::isfinite(g)) g = (p < 1.0 && ratio > 0.0) ? kGradClamp : (ratio == 0.0 ? 0.0 : 1.0);
+            double ratio = gs_fabs(delta[k]) / d;  // ∈ [0,1]
+            double g = gs_pow(ratio, p - 1.0);
+            if (!gs_isfinite(g))
+                g = (p < 1.0 && ratio > 0.0) ? kGradClamp : (ratio == 0.0 ? 0.0 : 1.0);
             g *= (delta[k] > 0.0) - (delta[k] < 0.0);
-            grad[k] = std::clamp(g, -kGradClamp, kGradClamp);
+            grad[k] = gs_clamp(g, -kGradClamp, kGradClamp);
         }
     } else {
         double S = 0.0;
         double fp[8];
         for (int k = 0; k < dim_; k++) {
-            Dual fk = f_.eval(std::fabs(delta[k]));
+            Dual fk = f_.eval(gs_fabs(delta[k]));
             S += fk.v;
             fp[k] = fk.d;
         }
         d = invertF(S);
-        if (!std::isfinite(d)) {
+        if (!gs_isfinite(d)) {
             dOut = 0.0;
             for (int k = 0; k < dim_; k++) grad[k] = 0.0;
             return false;
         }
         double fpd = f_.eval(d).d;
-        if (std::fabs(fpd) < 1e-300) fpd = fpd >= 0 ? 1e-300 : -1e-300;
+        if (gs_fabs(fpd) < 1e-300) fpd = fpd >= 0 ? 1e-300 : -1e-300;
         for (int k = 0; k < dim_; k++) {
             double g = fp[k] / fpd;
             g *= (delta[k] > 0.0) - (delta[k] < 0.0);
-            grad[k] = std::clamp(g, -kGradClamp, kGradClamp);
+            grad[k] = gs_clamp(g, -kGradClamp, kGradClamp);
         }
     }
     dOut = d;
     return true;
 }
 
-// ------------------------------------------------------------------ physics
+// ------------------------------------------------------------------ 物理
 
 void Simulation::computeAccel() {
     if (treeActive()) {
@@ -658,37 +757,35 @@ void Simulation::computeAccel() {
         accValid_ = true;
         return;
     }
-    const int n = (int)bodies_.size();
-    for (auto& b : bodies_) std::fill(b.acc.begin(), b.acc.end(), 0.0);
+    for (int i = 0; i < nbodies_; i++)
+        for (int k = 0; k < dim_; k++) bodies_[i].acc[k] = 0.0;
     double delta[8];
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
-        for (int j = i + 1; j < n; j++) {
+        for (int j = i + 1; j < nbodies_; j++) {
             if (!bodies_[j].alive) continue;
             double rho2 = 0.0;
             for (int k = 0; k < dim_; k++) {
                 delta[k] = bodies_[j].pos[k] - bodies_[i].pos[k];
                 rho2 += delta[k] * delta[k];
             }
-            if (!(rho2 > 0.0)) continue;  // coincident
+            if (!(rho2 > 0.0)) continue;  // 重合
             double d = metricDistance(delta);
-            if (!(d > 0.0) || !std::isfinite(d)) continue;
+            if (!(d > 0.0) || !gs_isfinite(d)) continue;
             const double Rij = bodies_[i].radius + bodies_[j].radius;
-            // Force scale: G*F(d) outside the core; inside the core the
-            // linear regularisation G*F(R)*(d/R) (C^0 in the force at d = R).
+            // 核外 G·F(d)；核内线性正则 G·F(R)·(d/R)（在 d = R 处力连续）
             double s;
             if (Rij > 0.0 && d < Rij) {
                 s = G_ * F_.value(Rij) * (d / Rij);
             } else {
                 s = G_ * F_.value(d);
             }
-            if (!std::isfinite(s)) continue;
-            if (std::fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
+            if (!gs_isfinite(s)) continue;
+            if (gs_fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
             if (s == 0.0) continue;
             const double mi = bodies_[i].mass, mj = bodies_[j].mass;
-            const double w = s / std::sqrt(rho2);
-            // central force: equal and opposite, along the separating line
-            // (pinned bodies exert force but receive none)
+            const double w = s / gs_sqrt(rho2);
+            // 中心力：等大反向，沿连线（钉住天体施力但不受力）
             for (int k = 0; k < dim_; k++) {
                 double f = w * delta[k];
                 if (!bodies_[i].fixed) bodies_[i].acc[k] += mj * f;
@@ -696,6 +793,7 @@ void Simulation::computeAccel() {
             }
         }
     }
+    accValid_ = true;
 }
 
 void Simulation::resolveContact(int i, int j) {
@@ -705,15 +803,14 @@ void Simulation::resolveContact(int i, int j) {
     double delta[8];
     for (int k = 0; k < dim_; k++) delta[k] = B.pos[k] - A.pos[k];
     double d = metricDistance(delta);
-    if (!std::isfinite(d)) return;
+    if (!gs_isfinite(d)) return;
     const double Rij = A.radius + B.radius;
     if (d > Rij) return;
 
     if (collisionMode_ == Collision::Merge) {
-        // A pinned body never takes part in a merger: the halo must stay
-        // intact, so the pair simply passes through (core-regularised).
+        // 钉住天体永不参与并合（晕必须保持完整）：退化成穿过（核内正则仍生效）
         if (A.fixed || B.fixed) return;
-        // Merge j into i (inelastic, momentum-conserving).
+        // 把 j 并进 i（完全非弹性，动量守恒）
         double M = A.mass + B.mass;
         for (int k = 0; k < dim_; k++) {
             A.pos[k] = (A.pos[k] * A.mass + B.pos[k] * B.mass) / M;
@@ -725,27 +822,25 @@ void Simulation::resolveContact(int i, int j) {
         B.alive = false;
         computeAccel();
     } else {  // Collision::Bounce
-        // Fully elastic impulse along the contact normal.  Consistent with
-        // the central-force model, the normal is the line joining the two
-        // centres (identical to the metric-gradient normal for f = t^2).
+        // 沿接触法向的完全弹性脉冲。与中心力模型一致，法向即两心连线
+        // （f = t^2 时与度量梯度法向完全相同）。
         double gn2 = 0.0;
         for (int k = 0; k < dim_; k++) gn2 += delta[k] * delta[k];
-        double gn = std::sqrt(gn2);
+        double gn = gs_sqrt(gn2);
         if (gn < 1e-300) return;
         double nrm[8];
-        double w = 0.0;  // closing speed along the normal
+        double w = 0.0;  // 沿法向的接近速度
         for (int k = 0; k < dim_; k++) {
-            nrm[k] = delta[k] / gn;  // A -> B
+            nrm[k] = delta[k] / gn;  // A → B
             w += (A.vel[k] - B.vel[k]) * nrm[k];
         }
-        if (w <= 0.0) return;  // already separating
-        // Impulse in inverse-mass form: a pinned body has zero inverse mass,
-        // i.e. infinite inertia, and reflects the other one elastically.
+        if (w <= 0.0) return;  // 已经在分离
+        // 逆质量形式的冲量：钉住天体逆质量为 0 ⇒ 无穷大惯性，只反射对方
         const double invA = A.fixed ? 0.0 : 1.0 / A.mass;
         const double invB = B.fixed ? 0.0 : 1.0 / B.mass;
         const double tot = invA + invB;
-        if (tot <= 0.0) return;  // both pinned
-        const double e = 1.0;  // perfectly elastic
+        if (tot <= 0.0) return;  // 两者都被钉住
+        const double e = 1.0;    // 完全弹性
         for (int k = 0; k < dim_; k++) {
             A.vel[k] -= (1.0 + e) * (invA / tot) * w * nrm[k];
             B.vel[k] += (1.0 + e) * (invB / tot) * w * nrm[k];
@@ -756,18 +851,15 @@ void Simulation::resolveContact(int i, int j) {
 void Simulation::handleCollisions() {
     if (collisionMode_ == Collision::Pass) return;
     if (treeActive()) {
-        // The tree from this substep's computeAccel() is still current
-        // (kicks do not move positions); merges inside resolveContact()
-        // re-execute computeAccel() themselves.
-        std::vector<std::pair<int, int>> pairs;
-        collectContacts(pairs);
-        for (const auto& pr : pairs) resolveContact(pr.first, pr.second);
+        // 本子步 computeAccel() 建的树仍然有效（kick 不移动位置）；
+        // resolveContact() 内部的并合会自己重算加速度。
+        collectContacts();
+        for (int c = 0; c < g_cN; c++) resolveContact(g_cA[c], g_cB[c]);
         return;
     }
-    const int n = (int)bodies_.size();
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
-        for (int j = i + 1; j < n; j++) {
+        for (int j = i + 1; j < nbodies_; j++) {
             if (!bodies_[j].alive) continue;
             resolveContact(i, j);
         }
@@ -777,22 +869,22 @@ void Simulation::handleCollisions() {
 bool Simulation::step(double dt, int substeps) {
     if (!ok_) return false;
     if (substeps < 1) substeps = 1;
-    if (!(dt > 0.0) || !std::isfinite(dt)) return false;
+    if (!(dt > 0.0) || !gs_isfinite(dt)) return false;
     if (!accValid_) computeAccel();
     const double h = dt;
     for (int s = 0; s < substeps; s++) {
-        // kick (half) + drift
-        for (auto& b : bodies_) {
-            if (!b.alive || b.fixed) continue;  // pinned bodies never move
+        // 半 kick + 漂移
+        for (int i = 0; i < nbodies_; i++) {
+            Body& b = bodies_[i];
+            if (!b.alive || b.fixed) continue;  // 钉住天体永不移动
             for (int k = 0; k < dim_; k++) {
                 b.vel[k] += 0.5 * h * b.acc[k];
                 b.pos[k] += b.vel[k] * h;
             }
         }
-        // new accelerations
-        computeAccel();
-        // kick (half)
-        for (auto& b : bodies_) {
+        computeAccel();  // 新加速度
+        for (int i = 0; i < nbodies_; i++) {
+            Body& b = bodies_[i];
             if (!b.alive || b.fixed) continue;
             for (int k = 0; k < dim_; k++) b.vel[k] += 0.5 * h * b.acc[k];
         }
@@ -804,8 +896,8 @@ bool Simulation::step(double dt, int substeps) {
 
 int Simulation::aliveCount() const {
     int c = 0;
-    for (auto& b : bodies_)
-        if (b.alive) c++;
+    for (int i = 0; i < nbodies_; i++)
+        if (bodies_[i].alive) c++;
     return c;
 }
 
@@ -815,18 +907,17 @@ double Simulation::potentialEnergy() const {
         return treePotential();
     }
     double U = 0.0;
-    const int n = (int)bodies_.size();
     double delta[8];
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < nbodies_; i++) {
         if (!bodies_[i].alive) continue;
-        for (int j = i + 1; j < n; j++) {
+        for (int j = i + 1; j < nbodies_; j++) {
             if (!bodies_[j].alive) continue;
             for (int k = 0; k < dim_; k++) delta[k] = bodies_[j].pos[k] - bodies_[i].pos[k];
             double d = metricDistance(delta);
-            if (!std::isfinite(d)) continue;
+            if (!gs_isfinite(d)) continue;
             const double Rij = bodies_[i].radius + bodies_[j].radius;
             double val = pairV(d, Rij);
-            if (std::isfinite(val)) U += bodies_[i].mass * bodies_[j].mass * val;
+            if (gs_isfinite(val)) U += bodies_[i].mass * bodies_[j].mass * val;
         }
     }
     return U;
@@ -834,7 +925,8 @@ double Simulation::potentialEnergy() const {
 
 double Simulation::energy() const {
     double KE = 0.0;
-    for (auto& b : bodies_) {
+    for (int i = 0; i < nbodies_; i++) {
+        const Body& b = bodies_[i];
         if (!b.alive) continue;
         double v2 = 0.0;
         for (int k = 0; k < dim_; k++) v2 += b.vel[k] * b.vel[k];
@@ -845,7 +937,8 @@ double Simulation::energy() const {
 
 int Simulation::getState(double* out, int maxBodies) const {
     int w = 0;
-    for (auto& b : bodies_) {
+    for (int i = 0; i < nbodies_; i++) {
+        const Body& b = bodies_[i];
         if (!b.alive) continue;
         if (w >= maxBodies) break;
         out[0] = b.mass;
@@ -858,45 +951,53 @@ int Simulation::getState(double* out, int maxBodies) const {
     return w;
 }
 
-void Simulation::samplePotential(int n, double rmin, double rmax, double* outR, double* outV) const {
+void Simulation::samplePotential(int n, double rmin, double rmax, double* outR,
+                                 double* outV) const {
     if (n < 1) return;
     if (!(rmin > 0.0)) rmin = 1e-6;
     if (rmax <= rmin) rmax = rmin * 1e6;
     for (int i = 0; i < n; i++) {
         double frac = (n == 1) ? 0.0 : (double)i / (n - 1);
-        double r = std::exp(std::log(rmin) + frac * (std::log(rmax) - std::log(rmin)));
-        double v = potentialAt(r);  // derived potential V = integral of F
+        double r = gs_exp(gs_log(rmin) + frac * (gs_log(rmax) - gs_log(rmin)));
+        double v = potentialAt(r);  // 派生势 V = ∫F
         outR[i] = r;
-        outV[i] = std::isfinite(v) ? v : NAN;
+        outV[i] = gs_isfinite(v) ? v : __builtin_nan("");
     }
 }
 
 int Simulation::unitBall2D(int n, double* outXY) const {
     if (n < 3) return 0;
     for (int i = 0; i < n; i++) {
-        double th = 2.0 * kPi * i / n;
-        double ux = std::cos(th), uy = std::sin(th);
-        // Solve metricDistance(rho * u) == 1 for rho by bisection.
+        double th = 2.0 * GS_PI * i / n;
+        double ux = gs_cos(th), uy = gs_sin(th);
+        // 二分求解 metricDistance(rho·u) == 1
         double lo = 0.0, hi = 1.0;
         int expand = 0;
+        double d[8];
+        for (int k = 0; k < 8; k++) d[k] = 0.0;
+        d[0] = ux;
+        d[1] = uy;
+        // 度量对 rho 单调：用缩放后的向量求距离
         auto dist = [&](double rho) {
-            double d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            d[0] = rho * ux;
-            d[1] = rho * uy;
-            return metricDistance(d);
+            double v[8];
+            for (int k = 0; k < 8; k++) v[k] = 0.0;
+            v[0] = rho * ux;
+            v[1] = rho * uy;
+            return metricDistance(v);
         };
         while (dist(hi) < 1.0 && expand < 60) {
             hi *= 2.0;
             expand++;
         }
-        if (dist(hi) < 1.0) {  // unreachable (bounded f)
-            outXY[2 * i] = NAN;
-            outXY[2 * i + 1] = NAN;
+        if (dist(hi) < 1.0) {  // 不可达（f 有界）
+            outXY[2 * i] = __builtin_nan("");
+            outXY[2 * i + 1] = __builtin_nan("");
             continue;
         }
         for (int it = 0; it < 60; it++) {
             double mid = 0.5 * (lo + hi);
-            if (dist(mid) < 1.0) lo = mid; else hi = mid;
+            if (dist(mid) < 1.0) lo = mid;
+            else hi = mid;
         }
         double rho = 0.5 * (lo + hi);
         outXY[2 * i] = rho * ux;

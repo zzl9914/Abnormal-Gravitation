@@ -24,7 +24,7 @@ static Result bench(int dims, int n, int treeMode, double theta, int wantSteps) 
     std::uniform_real_distribution<double> uni(0.0, 1.0);
     Simulation sim(dims, "t^2", "1/r^2");
     if (!sim.ok()) {
-        std::printf("  construct failed: %s\n", sim.error().c_str());
+        std::printf("  construct failed: %s\n", sim.error());
         return {0.0, 0};
     }
     sim.setCollision(Collision::Pass, 100.0);
@@ -76,9 +76,12 @@ int main(int argc, char** argv) {
         else if (a == "--steps" && i + 1 < argc) wantSteps = std::atoi(argv[++i]);
     }
     std::printf("Gravity benchmark  dims=%d  f=t^2  F=1/r^2  collision=pass\n", dims);
+    std::printf("body cap = %d (kMaxBodies：内核用固定容量数组，wasm 同)\n", grav::kMaxBodies);
     std::printf("%8s %10s %12s %14s\n", "N", "mode", "ms/step", "steps measured");
     const int Ns[] = {500, 1000, 2000, 4000, 8000, 16000, 32000};
     for (int n : Ns) {
+        // ⚠ 超过 kMaxBodies 时 addBody 会失败（静默少建天体），基准必须尊重上限
+        if (n > grav::kMaxBodies) continue;
         if (n <= directMax) {
             Result r = bench(dims, n, 1, 0.6, wantSteps);
             if (r.steps == 0) continue;

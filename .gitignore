@@ -8,6 +8,9 @@ __pycache__/
 # 验证脚本产出的截图
 shot_*.png
 
+# wasm 构建产物：web/gravity_wasm.js（base64 内联版）才是入库的那个
+web/gravity_core.wasm
+
 # 编辑器 / 系统
 .vscode/
 .idea/

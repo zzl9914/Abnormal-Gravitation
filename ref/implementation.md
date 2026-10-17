@@ -6,19 +6,96 @@
 
 ---
 
+## 0. 总体形态：JS 直连 wasm 内核
+
+```
+core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm（~54 KB）
+                                                      │ base64 内联
+                                                      ▼
+                                          web/gravity_wasm.js（零 fetch）
+                                                      │ WebAssembly.Instance
+                                                      ▼
+  index.html / three.html ──▶ web/gravity.js ──▶ gs_create / gs_step / gs_state_fill …
+                                     ▲
+                                     └─ 状态帧 = Float64Array 视图，指向 wasm 内存（零拷贝）
+```
+
+没有 Python、没有 HTTP 接口、没有 SSE、没有 JSON 帧。仿真完全在浏览器里跑，
+静态服务器（`web/tools/serve.js`）只负责把文件托管出去。
+
+这条路线决定了内核必须满足 **freestanding 约束**，见第 1 节。
+
 ## 1. 代码地图
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `core/expr.hpp` / `expr.cpp` | 80 / 622 | 表达式引擎：词法 → 递归下降 → RPN；对偶数前向自动微分；符号分解 `asPowerOfVar` / `asPowerSum` |
-| `core/sim.hpp` / `sim.cpp` | 206 / 908 | 模拟器：度量核、中心力、派生势、速度 Verlet、碰撞三模式、Barnes-Hut 树、能量监控 |
-| `core/api.cpp` | 173 | C ABI（`gs_*`），供 ctypes 消费；错误文本走 `gs_last_error()` |
+| `core/expr.hpp` / `expr.cpp` | ~80 / ~560 | 表达式引擎：词法 → 递归下降**直接发射 RPN**；对偶数前向自动微分；符号分解 `asPowerOfVar` / `asPowerSum` |
+| `core/sim.hpp` / `sim.cpp` | ~210 / ~900 | 模拟器：度量核、中心力、派生势、速度 Verlet、碰撞三模式、Barnes-Hut 树、能量监控 |
+| `core/api.cpp` | ~200 | C ABI（`gs_*`）：原生 FFI 与 wasm 共用同一套符号；含 wasm 零拷贝辅助函数 |
+| `core/gsmath.h` / `gsmath.cpp` | — | 数学抽象层：`gs_pow/gs_log/...` 原生用 libm，**wasm 由 JS 的 `Math.*` 提供** |
+| `core/gsstr.h` | — | 最小字符工具（`gs_strtod` / `gs_strcat*` / `isdigit`…），替代 `<cstring>/<cctype>/<cstdlib>` |
+| `core/gsrt_wasm.cpp` | — | freestanding 运行时：自己实现 `memcpy / memset / memmove`（仅 wasm 构建编译） |
 | `core/test_main.cpp` | 741 | 断言测试（当前 **63** 项，全过为准） |
 | `core/bench_main.cpp` | 97 | 直接求和 vs 树的性能基准 |
-| `server/core_wrap.py` | — | ctypes 封装（⚠ argtypes 必须与 C 签名逐一对齐） |
-| `server/server.py` | 409 | stdlib `ThreadingHTTPServer`：静态托管 + SSE 流 + POST 控制 + tick 预算调度 |
+| `web/gravity.js` | ~330 | JS ↔ 内核桥接：零拷贝状态帧、setup/control/标定、rAF tick 循环 |
+| `web/tools/build-kernel.js` | — | clang → wasm → base64 JS，并校验 import 表 |
+| `web/tools/check-bridge.js` | — | 桥接层自检（Node，无需浏览器）：**19** 项检查 |
+| `web/tools/serve.js` | — | 极简静态服务器（无业务逻辑） |
 | `web/index.html` | 837 | 主页：度量 f 预设 5、力律 F 预设 4、设置抽屉、运行控制台 |
 | `web/three.html` | 716 | 三体专页：锁定 f=t²、F=1/r²（2D）、场景库、交互布置 |
+
+### 1.1 freestanding 约束（改代码前必读）
+
+内核要能被 `clang --target=wasm32 -nostdlib -ffreestanding -fno-exceptions -fno-rtti`
+编译，因此：
+
+1. **不用 STL 容器**：没有 `std::vector` / `std::string` / `std::pair`。
+   一律固定容量数组 + 计数（`kMaxBodies = 4096`、`kMaxNodes = 16384`、
+   `kMaxExtra = 2048`、`kMaxContacts = 4096`、`kTabN = 4096`）。
+2. **不用 `new` / `delete`**：`Simulation` 放在 `api.cpp` 的静态槽位数组里
+   （slot 0 = 主模拟，slot 1 = 一次性探针）；句柄 = 槽位索引 + 1。
+3. **默认构造必须平凡**：所有成员都**没有**默认初始化器（否则会生成需要运行时
+   执行的动态初始化，而 freestanding 没有 `__wasm_call_ctors`）。语义默认值
+   （`density=100`、`G=1`、`theta=0.6`…）一律在 `init()` 里设置。静态实例靠
+   `.bss` 清零，所以固定容量大数组**不占 wasm 文件体积**。
+4. **数学走 `gsmath.h`**：`gs_pow / gs_log / gs_exp / gs_sin / gs_cos / gs_tan /
+   gs_atan` 是 `extern "C"`，wasm 侧由 JS 提供（`Math.*`）；
+   `sqrt / fabs / copysign` 用编译器内建，直接落到 wasm 原生指令；
+   `gs_tgamma` 用 Lanczos 近似自己实现（两侧同一份代码，避免 import）。
+5. **只 include clang 自带的 C 头**：`<stdint.h>` / `<stddef.h>`，**不能**用
+   `<cstdint>` / `<cstddef>`（wasm32 目标下找不到 libstdc++ 的 C++ 头）。
+6. 表达式引擎**不建 AST**，递归下降时直接发射 RPN（省掉 `new`）。
+
+共享静态工作缓冲（同一时刻只有一个树在活动，每次都重建）：
+
+- `g_nodes[kMaxNodes]` — 树节点（放在文件作用域，因为两个 Simulation 槽位
+  各存一份会太大）
+- `g_extraBody / g_extraNext` — bucket 的溢出链表（`TreeNode::extra` 是头索引，
+  取代原来的 `std::vector<int>`）
+- `g_cA / g_cB` — 收集到的接触对
+
+### 1.2 与 JS 的数据交换
+
+- **字符串参数**：JS 用 `TextEncoder` 写进 `gs_str_buf()`（1 KB），再传指针。
+- **double 数组参数**（pos/vel）：写进 `gs_dscratch()`（64 个 double）。
+- **状态帧**：`gs_state_fill()` 把 `[m,x,y,z,vx,vy,vz,flags]×N` 写进 `g_state`，
+  返回体数；`gs_state_buf()` 给指针；JS 直接
+  `new Float64Array(memory.buffer, ptr, n*8)` —— **零拷贝**。
+- **错误信息**：`gs_last_error()` 返回指针，JS 用 `TextDecoder` 解 UTF-8。
+- wasm 侧没有 malloc，JS 也不在 wasm 堆上分配，全部走上面这些静态缓冲。
+
+构建参数要点（`web/tools/build-kernel.js`）：
+
+```
+--target=wasm32 -O3 -nostdlib -ffreestanding -fno-exceptions -fno-rtti
+-Wl,--no-entry -Wl,--allow-undefined -Wl,--export-memory
+-Wl,--initial-memory=8388608 -Wl,--max-memory=268435456 -Wl,-zstack-size=1048576
+-Wl,--export=gs_create ...
+```
+
+⚠ 栈要 1 MB：`asPowerSum` 的符号栈是栈上数组（~34 KB），插入又是递归的。
+⚠ 原生侧反过来：`Simulation` 约 1 MB，测试里是**栈对象**，所以
+`gs_test.exe` / `gs_bench.exe` 链接时必须 `-Wl,--stack,67108864`（否则一启动就崩）。
 
 关键常量（`sim.cpp` / `sim.hpp`）：
 
@@ -288,29 +365,28 @@ acc += mj · w · delta
 
 ---
 
-## 8. 服务端（`server/server.py`）
+## 8. 运行调度（`web/gravity.js` 的 tick 循环）
 
-单进程 `ThreadingHTTPServer` + 一把 `Manager.lock` 串行化所有内核调用，
-`Manager` 自带一条 daemon 线程跑 tick 循环。
+调度逻辑从原来的 Python 服务端搬到了浏览器里，行为保持一致：
 
-**调度**：`TICK_HZ = 30`，`budget = 0.7 × interval`。每 tick 目标步数
-`substeps × speed`（夹到 `[1, 512]`），以**自适应 chunk** 分批发给内核：
+- **物理 tick 固定 30 Hz**（不是渲染帧率）：`requestAnimationFrame` 驱动渲染，
+  tick 按 `1000/30` ms 累积推进；单帧最多补 4 个 tick（切回标签页时不会一次性
+  补几百毫秒）。
+- **每 tick 步数** = `substeps × speed`，夹到 `[1, 512]`。
+- **墙钟预算**：`budget = 0.7 × interval`。批次以自适应 chunk 下发：
+  chunk 从 1 起，若这批耗时 `< 0.25 × budget` 就 ×4（上限 32），
+  每批结束检查预算，超了就停 → 高倍率重系统自动降级为「能跑多快跑多快」。
+  ⚠ 这个预算不能省：同步步进会阻塞 rAF，界面直接卡死。
+- **能量降频**：`n < 1000` 每 2 帧算一次，否则每 15 帧（树模式下 `energy()`
+  要重建树并全量遍历 PE）。
+- **零拷贝帧**：`sim.bodies` 每帧新建一个指向 wasm 内存的 `Float64Array`
+  子视图（不复制数据），渲染代码按 stride 8 读即可。
 
-- chunk 从 1 起步；若这批耗时 `< 0.25 × budget` 就把 chunk 放大（×4，上限 32）
-- 每批结束检查是否已超预算，超了就停 → 高倍率重系统自动降为「能跑多快跑多快」
-- ⚠ 这个预算是必须的：曾经 2500 体 ×16 让 tick 持锁 1s+，把 HTTP/SSE 饿死
-
-**能量**：`snapshot()` 里按 N 分级缓存，n < 1000 每 2 帧算一次，否则每 15 帧
-（树模式下 `energy()` 要重建树并全量遍历 PE，2500 体约 30 ms）。
-**SSE 帧率**：`n < 1500` → 30 Hz，`< 3000` → 12 Hz，否则 8 Hz。
-
-**端点**：`GET /`、`/three.html`、`/api/stream`、`/api/state`、`/api/analysis`；
-`POST /api/setup`、`/api/control`、`/api/calibrate`、`/api/reset`。
-其中 `/api/calibrate` 返回标定后的 `g` 与可选采样表 `fs`，前端据此按
+`Gravity.setup/control/reset/calibrate/analysis` 与旧的
+`/api/setup`、`/api/control`、`/api/reset`、`/api/calibrate`、`/api/analysis`
+一一对应，语义不变，只是从 HTTP + JSON 变成了进程内函数调用。
+其中 `calibrate` 返回标定后的 `g` 与可选采样表 `fs`，前端据此按
 `v = √(G·m_enc·F(r)·r)` 做**任意力律**的近平衡建云。
-
-**状态流格式**：`state.bodies` 为平铺数组，**步长 8**：
-`[m, x, y, z, vx, vy, vz, flags]`（2D 补零，`flags` bit0 = 钉住的晕）。
 
 ---
 
@@ -333,31 +409,45 @@ acc += mj · w · delta
 ## 10. 改动禁忌（每一条都是实测踩出来的）
 
 1. **`getState` 步长是 8**，第 8 个分量是 `flags`。改动波及 `test_main.cpp`、
-   `core_wrap.py`、`index.html`、`three.html`——漏改一处就是**静默错位**，不报错。
-2. **ctypes `argtypes` 必须与 C 签名逐一对齐**，否则在 64 位下参数被截断。
-3. **树反扫的 `com` 不变量**：扫过程中是 `Σ(pos·m)`，最后一趟才除质量。
+   `web/gravity.js`、`index.html`、`three.html`——漏改一处就是**静默错位**，不报错。
+2. **新增内核代码必须遵守 freestanding 约束**（§1.1）：不用 STL 容器、
+   不用 `new`、不给成员加默认初始化器、不用 `<cstdint>`。
+   一旦违反，wasm 构建会当场失败（或更糟：生成需要运行时初始化的段）。
+3. **需要新的数学函数时**，加到 `gsmath.h`：原生在 `gsmath.cpp` 里用 `std::*`
+   实现，wasm 侧则要同步在 `web/gravity.js` 的 importObject 里提供，
+   否则 `WebAssembly.instantiate` 直接报缺 import。
+4. **树反扫的 `com` 不变量**：扫过程中是 `Σ(pos·m)`，最后一趟才除质量。
    力正确但单元打不开，先查这里，别去查遍历逻辑。
-4. **力的误差指标要按力尺度 `aMax` 归一化**。按单体相对误差统计会被近零合力的
+5. **`kMaxBodies = 4096` 是硬上限**，`addBody` 超限返回 −1 并设置错误。
+   基准脚本已尊重该上限（曾出现 N=32000 只建出 4096 个天体的假加速）。
+6. **力的误差指标要按力尺度 `aMax` 归一化**。按单体相对误差统计会被近零合力的
    天体发散带偏，得到假阳性。
-5. **浏览器诊断脚本不能并行跑**：多个浏览器共享同一个服务器模拟实例，会互相抢配置，
-   曾导致「LJ 云 drift 170%」的误报，串行重跑是 0.1%。
-6. 在浏览器端遍历状态数组时**按 `s.n` 判界**，不要写 `i+k < a.length`——stride 8 下
+7. **原生测试/基准必须 `-Wl,--stack,67108864`**：`Simulation` 是 ~1 MB 的栈对象，
+   栈不够时进程一启动就死（表现为无输出、退出码 127，很难查）。
+8. 在浏览器端遍历状态数组时**按 `sim.n` 判界**，不要写 `i+k < a.length`——stride 8 下
    写成 `i+2` 会读到数组之外。
-7. `#genN` 是 **log10 刻度**（value = log10 N，范围 0.3–3.602），直接赋 2500 会被钳到 4000。
-8. E2E 里暂停要先用前端 `sim.running` 判位再点 `#playBtn`；直接
-   `POST /api/control` 会被 `applySetup` 里的 `running:true` 覆盖。
-9. **boot 时 `sim.running = true` 必须在 `applySetup()` 之前**，
-   否则启动即暂停（只改按钮文字不算）。
+9. `#genN` 是 **log10 刻度**（value = log10 N，范围 0.3–3.602），直接赋 2500 会被钳到 4000。
+10. **boot 顺序**：`sim.running = true` → `await Gravity.ready()` →
+    `connectStream()` → `applySetup()`。内核没 ready 就 setup 会拿到
+    「内核尚未初始化」，只改按钮文字则会启动即暂停。
 
 ---
 
 ## 11. 验证与基准
 
 ```bat
-build.bat            :: 编译内核 DLL + gs_test.exe + gs_bench.exe（需要 g++）
+build.bat            :: 原生：内核 DLL + gs_test.exe + gs_bench.exe（需要 g++）
 bin\gs_test.exe      :: 断言测试，输出 "ALL TESTS PASSED (0 failures)"
 bin\gs_bench.exe [--3d] [--direct-max N] [--steps N]
+
+build_wasm.bat       :: wasm：core/*.cpp → web/gravity_wasm.js（需要 clang + wasm32）
+node web\tools\check-bridge.js   :: 桥接层自检（19 项，含圆轨道守恒/标定/单位球/错误路径）
+start.bat            :: 静态服务器 → http://127.0.0.1:8123
 ```
+
+`check-bridge.js` 是 wasm 路径最快的回归手段：它覆盖 setup（含 fixed 晕）、
+圆轨道能量守恒、状态帧 stride/flags、G 标定、F 采样表、单位球形状、
+reset、非法 f/F 的拒绝，以及 2000 体的树模式耗时。
 
 测试覆盖面（按 `test_main.cpp` 分组）：T1 圆轨道能量守恒；T2/T3 各向异性度量下
 中心力方向与幅值；T2b 一般 F 的「力 = −∇(∫F)」有限差分校验；T4 度量梯度对拍；

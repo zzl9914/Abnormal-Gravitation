@@ -48,7 +48,7 @@ static double bodyAccelViaTinyStep(const std::string& f, const std::string& Flaw
                                    int dims, double m1, double m2,
                                    std::vector<double> p1, std::vector<double> p2,
                                    int axis) {
-    Simulation sim(dims, f, Flaw);
+    Simulation sim(dims, f.c_str(), Flaw.c_str());
     if (!sim.ok()) return NAN;
     std::vector<double> z(dims, 0.0);
     sim.setCollision(grav::Collision::Pass, 1e9);
@@ -67,7 +67,7 @@ int main() {
     // M=1000, satellite at r=1 with v=sqrt(M/r). Verlet keeps the orbit tight.
     {
         Simulation sim(2, "t^2", "1/r^2");
-        check(sim.ok(), "T1 construct", sim.error().c_str());
+        check(sim.ok(), "T1 construct", sim.error());
         double M = 1000.0;
         double p0[2] = {0, 0}, v0[2] = {0, 0};
         double p1[2] = {1, 0}, v1[2] = {0, std::sqrt(M)};
@@ -103,7 +103,7 @@ int main() {
         std::vector<double> p1 = {0.3, -0.2, 0.1};
         std::vector<double> p2 = {1.2, -0.5, 0.8};
         Simulation sim(dims, f, Flaw);
-        check(sim.ok(), "T2 construct", sim.error().c_str());
+        check(sim.ok(), "T2 construct", sim.error());
         std::vector<double> delta(3);
         double rho2 = 0.0;
         for (int k = 0; k < 3; k++) {
@@ -142,7 +142,7 @@ int main() {
         std::vector<double> p1 = {-0.4, 0.9, 0.2};
         std::vector<double> p2 = {0.8, 0.1, -0.6};
         Simulation sim(dims, f, Flaw);
-        check(sim.ok(), "T3 construct", sim.error().c_str());
+        check(sim.ok(), "T3 construct", sim.error());
         std::vector<double> delta(3);
         double rho2 = 0.0;
         for (int k = 0; k < 3; k++) {
@@ -194,7 +194,7 @@ int main() {
     // Metric gradient vs central finite differences (Lp, p=1.5, power path).
     {
         Simulation sim(3, "t^1.5", "1/r^2");
-        check(sim.ok(), "T4 construct", sim.error().c_str());
+        check(sim.ok(), "T4 construct", sim.error());
         double delta[3] = {0.7, -0.4, 1.1};
         double d;
         double grad[3];
@@ -222,7 +222,7 @@ int main() {
     // L1 unit ball is the diamond |x|+|y| = 1; derived-V sampling sanity.
     {
         Simulation sim(2, "t", "1/r^2");
-        check(sim.ok(), "T5 construct", sim.error().c_str());
+        check(sim.ok(), "T5 construct", sim.error());
         double xy[192];
         int n = sim.unitBall2D(96, xy);
         check(n == 96, "T5 unit ball size");

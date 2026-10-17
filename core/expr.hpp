@@ -1,80 +1,88 @@
 #pragma once
-// Dual-number expression engine.
-// Parses a user supplied formula (variable: "r" or "t") into an RPN program
-// that can be evaluated for value and exact first derivative simultaneously
-// (forward-mode automatic differentiation).
+// 对偶数表达式引擎（freestanding 友好）。
 //
-// Grammar (precedence low -> high):
+// 解析用户公式（变量为 "r" 或 "t"）成 RPN 程序，可同时求值与一阶精确导数
+// （前向模式自动微分）。
+//
+// 语法（优先级由低到高）：
 //   expr  := term (('+'|'-') term)*
 //   term  := unary (('*'|'/') unary)*
 //   unary := ('-'|'+') unary | power
-//   power := atom ('^' unary)?          // right associative, exponent may be signed
+//   power := atom ('^' unary)?          // 右结合，指数可带符号
 //   atom  := number | const | var | func '(' expr ')' | '(' expr ')'
 //
-// Built-in functions: sqrt exp ln log abs sgn sin cos tan atan
-// Constants: pi e
+// 内置函数：sqrt exp ln log abs sgn sin cos tan atan；常量：pi e
+//
+// ⚠ freestanding 约束：不使用 std::string / std::vector / new / 异常。
+//   token 与指令都是固定容量数组；解析时**直接发射 RPN**（不再建 AST）；
+//   默认构造必须保持平凡（静态存储靠 .bss 清零，没有运行时初始化器）。
 
-#include <cstdint>
-#include <string>
-#include <vector>
+#include <stdint.h>
+
+#include "gsmath.h"
 
 namespace grav {
 
+// 定长容量（超出即报错，不动态扩容）
+enum {
+    kMaxInsn = 256,     // RPN 指令数
+    kMaxTok = 256,      // token 数
+    kMaxExprStack = 130,
+    kMaxPowTerms = 16,  // 幂和项数
+    kMaxErr = 192       // 错误信息字符数
+};
+
 struct Dual {
-    double v = 0.0;
-    double d = 0.0;  // derivative w.r.t. the variable
-    Dual() = default;
-    Dual(double val, double der = 0.0) : v(val), d(der) {}
+    double v;  // 值
+    double d;  // 对变量的导数
 };
 
 enum class Op : uint8_t {
     PushVar,
     PushConst,
     Add, Sub, Mul, Div, Neg,
-    PowC,      // u ^ const          (insn.num = exponent)
-    PowGen,    // u ^ w  (both operands dual)
+    PowC,      // u ^ 常数   (insn.num = 指数)
+    PowGen,    // u ^ w      （两边都是对偶数）
     Sqrt, Exp, Ln, Abs, Sgn, Sin, Cos, Tan, Atan
 };
 
 struct Insn {
     Op op;
-    double num = 0.0;  // PushConst value / PowC exponent
+    double num;  // PushConst 的值 / PowC 的指数
 };
 
 class Expr {
 public:
-    Expr() = default;
-    // Non-throwing: on failure ok() == false and error() holds the reason.
-    Expr(const std::string& text, const std::string& varName);
+    Expr() {}  // 平凡：静态对象由 .bss 清零
+    Expr(const char* text, const char* varName) { compile(text, varName); }
 
     bool ok() const { return ok_; }
-    const std::string& error() const { return err_; }
+    const char* error() const { return err_; }
 
-    // Value only.
+    // 只求值
     double value(double x) const { return eval(x).v; }
-    // Value + exact derivative w.r.t. the variable.
+    // 值 + 精确一阶导数
     Dual eval(double x) const;
 
-    // Fast-path detection: expression is exactly  var^p  (p != 0) or  var.
-    // Returns true and sets p (1.0 for a bare variable).
+    // 快路径识别：表达式恰好是 var^p（p != 0）或 var（p = 1）
     bool asPowerOfVar(double& p) const;
 
-    // Decompose into a sum of power terms  sum_i a_i * var^p_i  if the
-    // expression is one (affine combinations of powers, products/quotients
-    // and integer roots of single terms).  Returns true with terms
-    // (p_i, a_i); zero coefficients are dropped.  Used to derive an exact
-    // antiderivative of a force law.
-    bool asPowerSum(std::vector<std::pair<double, double>>& terms) const;
+    // 分解成幂和 sum a_i * var^p_i（可用于从 F 解析反积分出 V）。
+    // 成功返回 true，项数写入 n（<= cap）。
+    bool asPowerSum(double* outP, double* outA, int cap, int& n) const;
 
-    bool triviallyConstant() const;  // program is a single PushConst
+    bool triviallyConstant() const;  // 程序只有一条 PushConst
+
+    // 编译（可重复调用，覆盖上一次的程序）。Simulation::init() 会调用它。
+    bool compile(const char* text, const char* varName);
 
 private:
-    bool compile(const std::string& text, const std::string& varName);
 
-    std::vector<Insn> prog_;
-    size_t depth_ = 0;
-    bool ok_ = false;
-    std::string err_;
+    Insn prog_[kMaxInsn];
+    int progLen_;
+    int maxDepth_;
+    bool ok_;
+    char err_[kMaxErr];
 };
 
 }  // namespace grav

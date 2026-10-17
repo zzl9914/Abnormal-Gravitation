@@ -1,485 +1,573 @@
 #include "expr.hpp"
 
-#include <cctype>
-#include <cmath>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
+#include "gsstr.h"
 
 namespace grav {
 
 namespace {
 
-// ---------------------------------------------------------------- tokenizer
-
 struct Tok {
     enum Kind { Num, Name, Op, LP, RP, End } kind;
     double num = 0.0;
-    std::string text;
     int pos = 0;
+    int len = 0;  // 文本长度（配合源串定位），避免保存字符串
 };
 
-std::vector<Tok> lex(const std::string& s, std::string& err) {
-    std::vector<Tok> out;
-    size_t i = 0;
-    const size_t n = s.size();
-    while (i < n) {
-        unsigned char c = (unsigned char)s[i];
-        if (std::isspace(c)) { i++; continue; }
-        bool digit = std::isdigit(c) != 0;
-        bool dot = c == '.' && i + 1 < n && std::isdigit((unsigned char)s[i + 1]);
-        if (digit || dot) {
-            size_t j = i;
-            while (j < n && (std::isdigit((unsigned char)s[j]) || s[j] == '.')) j++;
-            if (j < n && (s[j] == 'e' || s[j] == 'E')) {
-                size_t k = j + 1;
-                if (k < n && (s[k] == '+' || s[k] == '-')) k++;
-                if (k < n && std::isdigit((unsigned char)s[k])) {
-                    while (k < n && std::isdigit((unsigned char)s[k])) k++;
-                    j = k;
-                }
-            }
-            Tok t;
-            t.kind = Tok::Num;
-            t.text = s.substr(i, j - i);
-            t.num = std::strtod(t.text.c_str(), nullptr);
-            t.pos = (int)i;
-            if (!std::isfinite(t.num)) {
-                err = "数字无效: " + t.text;
-                return {};
-            }
-            out.push_back(t);
-            i = j;
-            continue;
-        }
-        if (std::isalpha(c) || c == '_') {
-            size_t j = i;
-            while (j < n && (std::isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
-            Tok t;
-            t.kind = Tok::Name;
-            t.text = s.substr(i, j - i);
-            t.pos = (int)i;
-            out.push_back(t);
-            i = j;
-            continue;
-        }
-        if (std::strchr("+-*/^()", c)) {
-            Tok t;
-            t.kind = (c == '(') ? Tok::LP : (c == ')') ? Tok::RP : Tok::Op;
-            t.text.assign(1, (char)c);
-            t.pos = (int)i;
-            out.push_back(t);
-            i++;
-            continue;
-        }
-        err = std::string("无法识别的字符 '") + (char)c + "'";
-        return {};
+// ---------------------------------------------------------------- tokenizer
+
+struct Lexer {
+    const char* s;
+    Tok toks[kMaxTok];
+    int n = 0;
+    char err[kMaxErr];
+
+    bool fail(const char* msg) {
+        err[0] = '\0';
+        gs_strcat(err, kMaxErr, msg);
+        return false;
     }
-    Tok end;
-    end.kind = Tok::End;
-    out.push_back(end);
-    return out;
-}
+    bool room() {
+        if (n + 2 > kMaxTok) return fail("表达式过长");
+        return true;
+    }
 
-// ---------------------------------------------------------------------- AST
-
-struct Node {
-    enum Kind { Var, Num, Neg, Bin, Fn } kind;
-    double num = 0.0;
-    char op = 0;
-    std::string fn;
-    std::unique_ptr<Node> a, b;
+    bool run() {
+        int i = 0;
+        while (s[i]) {
+            char c = s[i];
+            if (gs_isspace(c)) {
+                i++;
+                continue;
+            }
+            if (!room()) return false;
+            if (gs_isdigit(c) ||
+                (c == '.' && gs_isdigit(s[i + 1]))) {
+                const char* start = s + i;
+                const char* end = nullptr;
+                double v = gs_strtod(start, &end);
+                if (end == start) return fail("无法解析的数字");
+                if (!gs_isfinite(v)) return fail("数字无效");
+                Tok& t = toks[n++];
+                t.kind = Tok::Num;
+                t.num = v;
+                t.pos = i;
+                t.len = (int)(end - start);
+                i += t.len;
+                continue;
+            }
+            if (gs_isalpha(c)) {
+                int j = i;
+                while (s[j] && gs_isalnum(s[j])) j++;
+                Tok& t = toks[n++];
+                t.kind = Tok::Name;
+                t.pos = i;
+                t.len = j - i;
+                i = j;
+                continue;
+            }
+            if (c == '+' || c == '-' || c == '*' || c == '/' || c == '^' ||
+                c == '(' || c == ')') {
+                Tok& t = toks[n++];
+                t.kind = (c == '(') ? Tok::LP : (c == ')') ? Tok::RP : Tok::Op;
+                t.pos = i;
+                t.len = 1;
+                i++;
+                continue;
+            }
+            err[0] = '\0';
+            gs_strcat(err, kMaxErr, "无法识别的字符 '");
+            gs_strcat_char(err, kMaxErr, c);
+            gs_strcat(err, kMaxErr, "'");
+            return false;
+        }
+        Tok& end = toks[n++];
+        end.kind = Tok::End;
+        end.pos = i;
+        end.len = 0;
+        return true;
+    }
 };
 
-using NodeP = std::unique_ptr<Node>;
-
-NodeP makeNum(double v) {
-    NodeP p(new Node);
-    p->kind = Node::Num;
-    p->num = v;
-    return p;
-}
-
-NodeP makeVar() {
-    NodeP p(new Node);
-    p->kind = Node::Var;
-    return p;
-}
+// ------------------------------------------------------------------ parser
+// 递归下降，**直接发射 RPN**（freestanding 下没有 new，不再构造 AST）。
 
 struct Parser {
-    const std::vector<Tok>& toks;
-    const std::string& varName;
-    std::string err;
-    size_t pos = 0;
+    const Tok* toks;
+    const char* src;
+    const char* varName;
+    Insn* prog;
+    int progLen = 0;
+    int depth = 0;
+    int maxDepth = 0;
+    char err[kMaxErr];
 
     const Tok& peek() const { return toks[pos]; }
-    const Tok& next() { return toks[pos++]; }
+    int pos = 0;
 
-    NodeP parseExpr() {
-        NodeP left = parseTerm();
-        if (!left) return nullptr;
-        while (peek().kind == Tok::Op && (peek().text == "+" || peek().text == "-")) {
-            char op = next().text[0];
-            NodeP right = parseTerm();
-            if (!right) return nullptr;
-            NodeP p(new Node);
-            p->kind = Node::Bin;
-            p->op = op;
-            p->a = std::move(left);
-            p->b = std::move(right);
-            left = std::move(p);
-        }
-        return left;
+    bool isOp(char c) const {
+        const Tok& t = toks[pos];
+        return t.kind == Tok::Op && src[t.pos] == c;
+    }
+    bool tokIs(const Tok& t, const char* lit) const {
+        int L = gs_strlen(lit);
+        if (t.len != L) return false;
+        for (int i = 0; i < L; i++)
+            if (src[t.pos + i] != lit[i]) return false;
+        return true;
+    }
+    bool fail(const char* msg) {
+        err[0] = '\0';
+        gs_strcat(err, kMaxErr, msg);
+        return false;
+    }
+    bool room(int k) {
+        if (progLen + k > kMaxInsn) return fail("表达式过长");
+        return true;
     }
 
-    NodeP parseTerm() {
-        NodeP left = parseUnary();
-        if (!left) return nullptr;
-        while (peek().kind == Tok::Op && (peek().text == "*" || peek().text == "/")) {
-            char op = next().text[0];
-            NodeP right = parseUnary();
-            if (!right) return nullptr;
-            NodeP p(new Node);
-            p->kind = Node::Bin;
-            p->op = op;
-            p->a = std::move(left);
-            p->b = std::move(right);
-            left = std::move(p);
-        }
-        return left;
+    bool emitPush(Op op, double num = 0.0) {
+        if (!room(1)) return false;
+        prog[progLen].op = op;
+        prog[progLen].num = num;
+        progLen++;
+        depth++;
+        if (depth > maxDepth) maxDepth = depth;
+        return true;
+    }
+    bool emitNet0(Op op, double num = 0.0) {  // 消耗 1 压入 1
+        if (!room(1)) return false;
+        prog[progLen].op = op;
+        prog[progLen].num = num;
+        progLen++;
+        return true;
+    }
+    bool emitBin(Op op) {  // 消耗 2 压入 1
+        if (!room(1)) return false;
+        prog[progLen].op = op;
+        prog[progLen].num = 0.0;
+        progLen++;
+        depth--;
+        return true;
     }
 
-    NodeP parseUnary() {
-        if (peek().kind == Tok::Op && peek().text == "-") {
-            next();
-            NodeP inner = parseUnary();
-            if (!inner) return nullptr;
-            if (inner->kind == Node::Num) return makeNum(-inner->num);
-            NodeP p(new Node);
-            p->kind = Node::Neg;
-            p->a = std::move(inner);
-            return p;
+    bool parseExpr() {
+        if (!parseTerm()) return false;
+        while (isOp('+') || isOp('-')) {
+            char c = src[toks[pos].pos];
+            pos++;
+            if (!parseTerm()) return false;
+            if (!emitBin(c == '+' ? Op::Add : Op::Sub)) return false;
         }
-        if (peek().kind == Tok::Op && peek().text == "+") {
-            next();
+        return true;
+    }
+
+    bool parseTerm() {
+        if (!parseUnary()) return false;
+        while (isOp('*') || isOp('/')) {
+            char c = src[toks[pos].pos];
+            pos++;
+            if (!parseUnary()) return false;
+            if (!emitBin(c == '*' ? Op::Mul : Op::Div)) return false;
+        }
+        return true;
+    }
+
+    bool parseUnary() {
+        if (isOp('-')) {
+            pos++;
+            int mark = progLen;
+            if (!parseUnary()) return false;
+            // 常量折叠：-2 → PushConst(-2)。这样 r^-2 也能折叠成 PowC，
+            // 从而让 F = 1/r^2 之类的表达式走**解析反积分**而不是数值表。
+            if (progLen == mark + 1 && prog[mark].op == Op::PushConst) {
+                prog[mark].num = -prog[mark].num;
+                return true;
+            }
+            return emitNet0(Op::Neg);
+        }
+        if (isOp('+')) {
+            pos++;
             return parseUnary();
         }
         return parsePower();
     }
 
-    NodeP parsePower() {
-        NodeP base = parseAtom();
-        if (!base) return nullptr;
-        if (peek().kind == Tok::Op && peek().text == "^") {
-            next();
-            NodeP expo = parseUnary();  // right associative; allows r^-2
-            if (!expo) return nullptr;
-            NodeP p(new Node);
-            p->kind = Node::Bin;
-            p->op = '^';
-            p->a = std::move(base);
-            p->b = std::move(expo);
-            return p;
+    bool parsePower() {
+        if (!parseAtom()) return false;
+        if (isOp('^')) {
+            pos++;
+            int mark = progLen;
+            if (!parseUnary()) return false;  // 右结合；允许 r^-2
+            if (progLen == mark + 1 && prog[mark].op == Op::PushConst) {
+                double c = prog[mark].num;
+                progLen = mark;  // 弹出常数，换成 PowC
+                // 深度修正：[常数, PowGen] 净 −1；[PowC] 净 0
+                depth--;
+                return emitNet0(Op::PowC, c);
+            }
+            return emitBin(Op::PowGen);
         }
-        return base;
+        return true;
     }
 
-    NodeP parseAtom() {
+    bool parseAtom() {
         const Tok& t = peek();
         if (t.kind == Tok::Num) {
-            next();
-            return makeNum(t.num);
+            pos++;
+            return emitPush(Op::PushConst, t.num);
         }
         if (t.kind == Tok::LP) {
-            next();
-            NodeP e = parseExpr();
-            if (!e) return nullptr;
-            if (peek().kind != Tok::RP) {
-                err = "缺少右括号";
-                return nullptr;
-            }
-            next();
-            return e;
+            pos++;
+            if (!parseExpr()) return false;
+            if (peek().kind != Tok::RP) return fail("缺少右括号");
+            pos++;
+            return true;
         }
         if (t.kind == Tok::Name) {
-            next();
-            const std::string& name = t.text;
-            if (name == varName) return makeVar();
-            if (name == "pi") return makeNum(3.14159265358979323846);
-            if (name == "e") return makeNum(2.71828182845904523536);
-            static const char* kFns[] = {"sqrt", "exp", "ln", "log", "abs", "sgn",
-                                         "sin", "cos", "tan", "atan"};
-            for (const char* f : kFns) {
-                if (name == f) {
-                    if (peek().kind != Tok::LP) {
-                        err = "函数 " + name + " 后需要 '('";
-                        return nullptr;
-                    }
-                    next();
-                    NodeP arg = parseExpr();
-                    if (!arg) return nullptr;
-                    if (peek().kind != Tok::RP) {
-                        err = "函数 " + name + " 缺少右括号";
-                        return nullptr;
-                    }
-                    next();
-                    NodeP p(new Node);
-                    p->kind = Node::Fn;
-                    p->fn = name;
-                    p->a = std::move(arg);
-                    return p;
-                }
+            if (tokIs(t, varName)) {
+                pos++;
+                return emitPush(Op::PushVar);
             }
-            err = "未知名称 '" + name + "'（变量应为 " + varName + "）";
-            return nullptr;
+            if (tokIs(t, "pi")) {
+                pos++;
+                return emitPush(Op::PushConst, GS_PI);
+            }
+            if (tokIs(t, "e")) {
+                pos++;
+                return emitPush(Op::PushConst, 2.71828182845904523536);
+            }
+            static const char* kFns[] = {"sqrt", "exp", "ln",  "log", "abs",
+                                         "sgn",  "sin", "cos", "tan", "atan"};
+            static const Op kOps[] = {Op::Sqrt, Op::Exp, Op::Ln,  Op::Ln, Op::Abs,
+                                      Op::Sgn,  Op::Sin, Op::Cos, Op::Tan, Op::Atan};
+            for (int i = 0; i < 10; i++) {
+                if (!tokIs(t, kFns[i])) continue;
+                pos++;
+                if (peek().kind != Tok::LP) {
+                    err[0] = '\0';
+                    gs_strcat(err, kMaxErr, "函数 ");
+                    gs_strcat(err, kMaxErr, kFns[i]);
+                    gs_strcat(err, kMaxErr, " 后需要 '('");
+                    return false;
+                }
+                pos++;
+                if (!parseExpr()) return false;
+                if (peek().kind != Tok::RP) {
+                    err[0] = '\0';
+                    gs_strcat(err, kMaxErr, "函数 ");
+                    gs_strcat(err, kMaxErr, kFns[i]);
+                    gs_strcat(err, kMaxErr, " 缺少右括号");
+                    return false;
+                }
+                pos++;
+                return emitNet0(kOps[i]);
+            }
+            err[0] = '\0';
+            gs_strcat(err, kMaxErr, "未知名称 '");
+            for (int i = 0; i < t.len && i < 24; i++)
+                gs_strcat_char(err, kMaxErr, src[t.pos + i]);
+            gs_strcat(err, kMaxErr, "'（变量应为 ");
+            gs_strcat(err, kMaxErr, varName);
+            gs_strcat(err, kMaxErr, "）");
+            return false;
         }
-        err = "此处应为数字、变量、函数或 '('";
-        return nullptr;
+        return fail("此处应为数字、变量、函数或 '('");
     }
 };
 
-// ----------------------------------------------------------------- compiler
-// `depth` = number of values currently on the evaluation stack.
-// Every compiled sub-expression leaves exactly one value on the stack.
+// ------------------------------------------------------------ 幂和符号栈
 
-struct Compiler {
-    std::vector<Insn> prog;
-    size_t depth = 0;
-    size_t maxDepth = 0;
+struct PolySum {
+    double p[kMaxPowTerms];
+    double a[kMaxPowTerms];
+    int n = 0;
+    bool over = false;  // 项数溢出：调用方按失败处理（走数值表路径）
 
-    void push1(Op op, double num = 0.0) {  // net +1
-        Insn in;
-        in.op = op;
-        in.num = num;
-        prog.push_back(in);
-        depth++;
-        if (depth > maxDepth) maxDepth = depth;
+    void clear() {
+        n = 0;
+        over = false;
     }
-    void net0(Op op, double num = 0.0) {  // consumes 1, pushes 1
-        Insn in;
-        in.op = op;
-        in.num = num;
-        prog.push_back(in);
+    int find(double pp) const {
+        for (int i = 0; i < n; i++)
+            if (p[i] == pp) return i;
+        return -1;
     }
-    void binary(Op op) {  // consumes 2, pushes 1
-        Insn in;
-        in.op = op;
-        prog.push_back(in);
-        depth--;
-    }
-
-    void run(const Node* nd) {
-        switch (nd->kind) {
-            case Node::Var:
-                push1(Op::PushVar);
-                break;
-            case Node::Num:
-                push1(Op::PushConst, nd->num);
-                break;
-            case Node::Neg:
-                run(nd->a.get());
-                net0(Op::Neg);
-                break;
-            case Node::Bin:
-                if (nd->op == '^' && nd->b->kind == Node::Num) {
-                    run(nd->a.get());
-                    net0(Op::PowC, nd->b->num);
-                } else {
-                    run(nd->a.get());
-                    run(nd->b.get());
-                    switch (nd->op) {
-                        case '+': binary(Op::Add); break;
-                        case '-': binary(Op::Sub); break;
-                        case '*': binary(Op::Mul); break;
-                        case '/': binary(Op::Div); break;
-                        case '^': binary(Op::PowGen); break;
-                    }
+    void insert(double pp, double aa) {
+        if (aa == 0.0) return;
+        int k = find(pp);
+        if (k >= 0) {
+            a[k] += aa;
+            if (a[k] == 0.0) {  // 完全抵消：删除该幂
+                for (int j = k; j + 1 < n; j++) {
+                    p[j] = p[j + 1];
+                    a[j] = a[j + 1];
                 }
-                break;
-            case Node::Fn: {
-                run(nd->a.get());
-                Op op;
-                if (nd->fn == "sqrt") op = Op::Sqrt;
-                else if (nd->fn == "exp") op = Op::Exp;
-                else if (nd->fn == "ln" || nd->fn == "log") op = Op::Ln;
-                else if (nd->fn == "abs") op = Op::Abs;
-                else if (nd->fn == "sgn") op = Op::Sgn;
-                else if (nd->fn == "sin") op = Op::Sin;
-                else if (nd->fn == "cos") op = Op::Cos;
-                else if (nd->fn == "tan") op = Op::Tan;
-                else op = Op::Atan;
-                net0(op);
-                break;
+                n--;
             }
+            return;
         }
+        if (n >= kMaxPowTerms) {
+            over = true;
+            return;
+        }
+        p[n] = pp;
+        a[n] = aa;
+        n++;
+    }
+    void add(const PolySum& o, double sign) {
+        for (int i = 0; i < o.n; i++) insert(o.p[i], sign * o.a[i]);
+        if (o.over) over = true;
+    }
+    void negate() {
+        for (int i = 0; i < n; i++) a[i] = -a[i];
+    }
+    bool mul(const PolySum& o) {  // 笛卡尔积，指数相加系数相乘
+        PolySum r;
+        r.clear();
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < o.n; j++) {
+                r.insert(p[i] + o.p[j], a[i] * o.a[j]);
+                if (r.over) return false;
+            }
+        *this = r;
+        return true;
+    }
+    bool div(const PolySum& o) {  // 分母必须是单项
+        if (o.n != 1) return false;
+        if (o.a[0] == 0.0) return false;
+        for (int i = 0; i < n; i++) {
+            p[i] -= o.p[0];
+            a[i] /= o.a[0];
+        }
+        return true;
+    }
+    bool powC(double c) {  // 只允许单项：(a r^p)^c = a^c r^{pc}
+        if (n == 0) {
+            if (c == 0.0) insert(0.0, 1.0);
+            return c >= 0.0;
+        }
+        if (n != 1) return false;
+        if (a[0] == 0.0) return false;
+        a[0] = gs_pow(a[0], c);
+        p[0] *= c;
+        return true;
     }
 };
 
 }  // namespace
 
-Expr::Expr(const std::string& text, const std::string& varName) {
-    compile(text, varName);
-}
+// ------------------------------------------------------------------ compile
 
-bool Expr::compile(const std::string& text, const std::string& varName) {
-    if (text.empty()) {
-        err_ = "表达式为空";
+bool Expr::compile(const char* text, const char* varName) {
+    progLen_ = 0;
+    maxDepth_ = 0;
+    ok_ = false;
+    err_[0] = '\0';
+    if (!text || !text[0]) {
+        gs_strcat(err_, kMaxErr, "表达式为空");
         return false;
     }
-    std::string lexErr;
-    std::vector<Tok> toks = lex(text, lexErr);
-    if (!lexErr.empty()) {
-        err_ = lexErr;
+    Lexer lx;
+    lx.s = text;
+    lx.n = 0;
+    lx.err[0] = '\0';
+    if (!lx.run()) {
+        gs_strcat(err_, kMaxErr, lx.err);
         return false;
     }
-    Parser p{toks, varName, {}, 0};
-    NodeP root = p.parseExpr();
-    if (!root) {
-        err_ = p.err.empty() ? "解析失败" : p.err;
+    Parser p;
+    p.toks = lx.toks;
+    p.src = text;
+    p.varName = varName;
+    p.prog = prog_;
+    p.pos = 0;
+    p.err[0] = '\0';
+    if (!p.parseExpr()) {
+        gs_strcat(err_, kMaxErr, p.err);
         return false;
     }
     if (p.peek().kind != Tok::End) {
-        err_ = "表达式末尾有多余内容";
+        gs_strcat(err_, kMaxErr, "表达式末尾有多余内容");
         return false;
     }
-    Compiler c;
-    c.run(root.get());
-    if (c.depth != 1 || c.maxDepth == 0) {
-        err_ = "表达式结构无效";
+    if (p.depth != 1 || p.maxDepth == 0) {
+        gs_strcat(err_, kMaxErr, "表达式结构无效");
         return false;
     }
-    if (c.maxDepth > 128) {
-        err_ = "表达式嵌套过深";
+    if (p.maxDepth > kMaxExprStack - 8) {
+        gs_strcat(err_, kMaxErr, "表达式嵌套过深");
         return false;
     }
-    prog_ = std::move(c.prog);
-    depth_ = c.maxDepth;
+    progLen_ = p.progLen;
+    maxDepth_ = p.maxDepth;
     ok_ = true;
     return true;
 }
 
+// --------------------------------------------------------------------- eval
+
 Dual Expr::eval(double x) const {
-    Dual st[130];
+    Dual st[kMaxExprStack];
     int sp = 0;
-    for (const Insn& in : prog_) {
+    const double kNaN = __builtin_nan("");
+    for (int i = 0; i < progLen_; i++) {
+        const Insn& in = prog_[i];
         switch (in.op) {
-            case Op::PushVar: st[sp++] = Dual(x, 1.0); break;
-            case Op::PushConst: st[sp++] = Dual(in.num, 0.0); break;
+            case Op::PushVar: st[sp].v = x; st[sp].d = 1.0; sp++; break;
+            case Op::PushConst: st[sp].v = in.num; st[sp].d = 0.0; sp++; break;
             case Op::Add: {
-                Dual b = st[--sp], a = st[sp - 1];
-                st[sp - 1] = Dual(a.v + b.v, a.d + b.d);
+                Dual b = st[sp - 1], a = st[sp - 2];
+                st[sp - 2].v = a.v + b.v;
+                st[sp - 2].d = a.d + b.d;
+                sp--;
                 break;
             }
             case Op::Sub: {
-                Dual b = st[--sp], a = st[sp - 1];
-                st[sp - 1] = Dual(a.v - b.v, a.d - b.d);
+                Dual b = st[sp - 1], a = st[sp - 2];
+                st[sp - 2].v = a.v - b.v;
+                st[sp - 2].d = a.d - b.d;
+                sp--;
                 break;
             }
             case Op::Mul: {
-                Dual b = st[--sp], a = st[sp - 1];
-                st[sp - 1] = Dual(a.v * b.v, a.d * b.v + a.v * b.d);
+                Dual b = st[sp - 1], a = st[sp - 2];
+                st[sp - 2].v = a.v * b.v;
+                st[sp - 2].d = a.d * b.v + a.v * b.d;
+                sp--;
                 break;
             }
             case Op::Div: {
-                Dual b = st[--sp], a = st[sp - 1];
+                Dual b = st[sp - 1], a = st[sp - 2];
                 if (b.v == 0.0) {
-                    if (a.v == 0.0) st[sp - 1] = Dual(NAN, NAN);
-                    else st[sp - 1] = Dual(std::copysign(INFINITY, a.v),
-                                           a.d == 0.0 ? 0.0 : std::copysign(INFINITY, a.d));
+                    if (a.v == 0.0) {
+                        st[sp - 2].v = kNaN;
+                        st[sp - 2].d = kNaN;
+                    } else {
+                        st[sp - 2].v = gs_copysign(__builtin_inf(), a.v);
+                        st[sp - 2].d = (a.d == 0.0) ? 0.0
+                                                    : gs_copysign(__builtin_inf(), a.d);
+                    }
                 } else {
-                    st[sp - 1] = Dual(a.v / b.v, (a.d * b.v - a.v * b.d) / (b.v * b.v));
+                    st[sp - 2].v = a.v / b.v;
+                    st[sp - 2].d = (a.d * b.v - a.v * b.d) / (b.v * b.v);
                 }
+                sp--;
                 break;
             }
             case Op::Neg: {
-                Dual& a = st[sp - 1];
-                a = Dual(-a.v, -a.d);
+                st[sp - 1].v = -st[sp - 1].v;
+                st[sp - 1].d = -st[sp - 1].d;
                 break;
             }
             case Op::PowC: {
                 Dual a = st[sp - 1];
                 const double c = in.num;
-                double val = std::pow(a.v, c);
+                double val = gs_pow(a.v, c);
                 double der;
                 if (a.v != 0.0) {
-                    der = c * std::pow(a.v, c - 1.0) * a.d;
+                    der = c * gs_pow(a.v, c - 1.0) * a.d;
                 } else if (c == 1.0) {
                     der = a.d;
                 } else if (c > 1.0) {
                     der = 0.0;
                 } else {
-                    der = (a.d == 0.0) ? 0.0 : std::copysign(INFINITY, a.d);
+                    der = (a.d == 0.0) ? 0.0 : gs_copysign(__builtin_inf(), a.d);
                 }
-                st[sp - 1] = Dual(val, der);
+                st[sp - 1].v = val;
+                st[sp - 1].d = der;
                 break;
             }
             case Op::PowGen: {
-                Dual w = st[--sp], a = st[sp - 1];
+                Dual w = st[sp - 1], a = st[sp - 2];
                 if (a.v > 0.0) {
-                    double val = std::pow(a.v, w.v);
-                    st[sp - 1] = Dual(val, val * (w.d * std::log(a.v) + w.v * a.d / a.v));
+                    double val = gs_pow(a.v, w.v);
+                    st[sp - 2].v = val;
+                    st[sp - 2].d = val * (w.d * gs_log(a.v) + w.v * a.d / a.v);
                 } else if (a.v == 0.0 && w.v == 0.0) {
-                    st[sp - 1] = Dual(1.0, 0.0);
+                    st[sp - 2].v = 1.0;
+                    st[sp - 2].d = 0.0;
                 } else {
-                    st[sp - 1] = Dual(NAN, NAN);
+                    st[sp - 2].v = kNaN;
+                    st[sp - 2].d = kNaN;
                 }
+                sp--;
                 break;
             }
             case Op::Sqrt: {
                 Dual a = st[sp - 1];
                 if (a.v > 0.0) {
-                    double s = std::sqrt(a.v);
-                    st[sp - 1] = Dual(s, a.d / (2.0 * s));
+                    double s = gs_sqrt(a.v);
+                    st[sp - 1].v = s;
+                    st[sp - 1].d = a.d / (2.0 * s);
                 } else if (a.v == 0.0) {
-                    st[sp - 1] = Dual(0.0, a.d == 0.0 ? 0.0 : std::copysign(INFINITY, a.d));
+                    st[sp - 1].v = 0.0;
+                    st[sp - 1].d =
+                        (a.d == 0.0) ? 0.0 : gs_copysign(__builtin_inf(), a.d);
                 } else {
-                    st[sp - 1] = Dual(NAN, NAN);
+                    st[sp - 1].v = kNaN;
+                    st[sp - 1].d = kNaN;
                 }
                 break;
             }
             case Op::Exp: {
                 Dual a = st[sp - 1];
-                double ev = std::exp(a.v);
-                st[sp - 1] = Dual(ev, ev * a.d);
+                double ev = gs_exp(a.v);
+                st[sp - 1].v = ev;
+                st[sp - 1].d = ev * a.d;
                 break;
             }
             case Op::Ln: {
                 Dual a = st[sp - 1];
-                if (a.v > 0.0) st[sp - 1] = Dual(std::log(a.v), a.d / a.v);
-                else st[sp - 1] = Dual(NAN, NAN);
+                if (a.v > 0.0) {
+                    st[sp - 1].v = gs_log(a.v);
+                    st[sp - 1].d = a.d / a.v;
+                } else {
+                    st[sp - 1].v = kNaN;
+                    st[sp - 1].d = kNaN;
+                }
                 break;
             }
             case Op::Abs: {
                 Dual a = st[sp - 1];
                 double s = (a.v > 0.0) - (a.v < 0.0);
-                st[sp - 1] = Dual(std::fabs(a.v), a.d * s);
+                st[sp - 1].v = gs_fabs(a.v);
+                st[sp - 1].d = a.d * s;
                 break;
             }
             case Op::Sgn: {
                 Dual a = st[sp - 1];
-                st[sp - 1] = Dual((a.v > 0.0) - (a.v < 0.0), 0.0);
+                st[sp - 1].v = (a.v > 0.0) - (a.v < 0.0);
+                st[sp - 1].d = 0.0;
                 break;
             }
             case Op::Sin: {
                 Dual a = st[sp - 1];
-                st[sp - 1] = Dual(std::sin(a.v), std::cos(a.v) * a.d);
+                st[sp - 1].v = gs_sin(a.v);
+                st[sp - 1].d = gs_cos(a.v) * a.d;
                 break;
             }
             case Op::Cos: {
                 Dual a = st[sp - 1];
-                st[sp - 1] = Dual(std::cos(a.v), -std::sin(a.v) * a.d);
+                st[sp - 1].v = gs_cos(a.v);
+                st[sp - 1].d = -gs_sin(a.v) * a.d;
                 break;
             }
             case Op::Tan: {
                 Dual a = st[sp - 1];
-                double c = std::cos(a.v);
-                if (std::fabs(c) < 1e-300) st[sp - 1] = Dual(NAN, NAN);
-                else st[sp - 1] = Dual(std::tan(a.v), a.d / (c * c));
+                double c = gs_cos(a.v);
+                if (gs_fabs(c) < 1e-300) {
+                    st[sp - 1].v = kNaN;
+                    st[sp - 1].d = kNaN;
+                } else {
+                    st[sp - 1].v = gs_tan(a.v);
+                    st[sp - 1].d = a.d / (c * c);
+                }
                 break;
             }
             case Op::Atan: {
                 Dual a = st[sp - 1];
-                st[sp - 1] = Dual(std::atan(a.v), a.d / (1.0 + a.v * a.v));
+                st[sp - 1].v = gs_atan(a.v);
+                st[sp - 1].d = a.d / (1.0 + a.v * a.v);
                 break;
             }
         }
@@ -489,134 +577,98 @@ Dual Expr::eval(double x) const {
 
 bool Expr::asPowerOfVar(double& p) const {
     if (!ok_) return false;
-    if (prog_.size() == 1 && prog_[0].op == Op::PushVar) {
+    if (progLen_ == 1 && prog_[0].op == Op::PushVar) {
         p = 1.0;
         return true;
     }
-    // Compiler emits [PushVar, PowC(exp)] (exponent folded into the insn).
-    if (prog_.size() == 2 && prog_[0].op == Op::PushVar && prog_[1].op == Op::PowC) {
+    // 编译器对「指数为字面常数」发射 [PushVar, PowC(指数)]
+    if (progLen_ == 2 && prog_[0].op == Op::PushVar && prog_[1].op == Op::PowC) {
         p = prog_[1].num;
         return p != 0.0;
     }
     return false;
 }
 
-// ---------------------------------------------------------------- power sums
-
-namespace {
-
-// Symbolic "sum of a*r^p" carried through the RPN program.  Operations keep
-// the representation closed whenever the result is again a power sum and
-// fail (return false) otherwise.
-struct PolySum {
-    std::vector<std::pair<double, double>> t;  // (p, a): sum a*r^p
-
-    static PolySum cst(double c) {
-        PolySum s;
-        if (c != 0.0) s.t.push_back({0.0, c});
-        return s;
-    }
-    static PolySum var() {
-        PolySum s;
-        s.t.push_back({1.0, 1.0});
-        return s;
-    }
-
-    void insert(double p, double a) {
-        if (a == 0.0) return;
-        for (size_t i = 0; i < t.size(); i++) {
-            if (t[i].first == p) {
-                t[i].second += a;
-                if (t[i].second == 0.0) t.erase(t.begin() + i);
-                return;
-            }
-        }
-        t.push_back({p, a});
-    }
-    void add(const PolySum& o, double sign) {
-        for (const auto& e : o.t) insert(e.first, sign * e.second);
-    }
-    void negate() {
-        for (auto& e : t) e.second = -e.second;
-    }
-    bool mul(const PolySum& o, size_t cap) {  // cartesian product stays closed
-        std::vector<std::pair<double, double>> r;
-        for (const auto& e1 : t) {
-            for (const auto& e2 : o.t) {
-                double p = e1.first + e2.first, a = e1.second * e2.second;
-                bool merged = false;
-                for (auto& x : r)
-                    if (x.first == p) { x.second += a; merged = true; break; }
-                if (!merged) r.push_back({p, a});
-            }
-            if (r.size() > cap) return false;
-        }
-        t = std::move(r);
-        return true;
-    }
-    bool div(const PolySum& o) {  // denominator must be a single term
-        if (o.t.size() != 1) return false;
-        double q = o.t[0].first, b = o.t[0].second;
-        if (b == 0.0) return false;
-        for (auto& e : t) {
-            e.first -= q;
-            e.second /= b;
-        }
-        return true;
-    }
-    bool powC(double c) {  // single term only: (a r^p)^c = a^c r^{pc}
-        if (t.empty()) {           // zero^c
-            if (c == 0.0) t.push_back({0.0, 1.0});
-            return c >= 0.0;
-        }
-        if (t.size() != 1) return false;
-        if (t[0].second == 0.0) return false;  // (0 r^p): keep as zero
-        t[0].second = std::pow(t[0].second, c);
-        t[0].first *= c;
-        return true;
-    }
-};
-
-}  // namespace
-
-bool Expr::asPowerSum(std::vector<std::pair<double, double>>& terms) const {
+bool Expr::asPowerSum(double* outP, double* outA, int cap, int& n) const {
+    n = 0;
     if (!ok_) return false;
-    static const size_t kCap = 64;
-    std::vector<PolySum> st;
-    auto pop = [&]() { PolySum v = std::move(st.back()); st.pop_back(); return v; };
-    for (const Insn& in : prog_) {
+    PolySum st[kMaxExprStack];
+    int sp = 0;
+    for (int i = 0; i < progLen_; i++) {
+        const Insn& in = prog_[i];
         switch (in.op) {
-            case Op::PushVar: st.push_back(PolySum::var()); break;
-            case Op::PushConst: st.push_back(PolySum::cst(in.num)); break;
-            case Op::Neg: { PolySum a = pop(); a.negate(); st.push_back(std::move(a)); break; }
-            case Op::Add: { PolySum b = pop(), a = pop(); a.add(b, +1.0); st.push_back(std::move(a)); break; }
-            case Op::Sub: { PolySum b = pop(), a = pop(); a.add(b, -1.0); st.push_back(std::move(a)); break; }
-            case Op::Mul: { PolySum b = pop(), a = pop(); if (!a.mul(b, kCap)) return false; st.push_back(std::move(a)); break; }
-            case Op::Div: { PolySum b = pop(), a = pop(); if (!a.div(b)) return false; st.push_back(std::move(a)); break; }
-            case Op::PowC: { PolySum a = pop(); if (!a.powC(in.num)) return false; st.push_back(std::move(a)); break; }
-            case Op::Sqrt: { PolySum a = pop(); if (!a.powC(0.5)) return false; st.push_back(std::move(a)); break; }
+            case Op::PushVar: {
+                st[sp].clear();
+                st[sp].insert(1.0, 1.0);
+                sp++;
+                break;
+            }
+            case Op::PushConst: {
+                st[sp].clear();
+                st[sp].insert(0.0, in.num);
+                sp++;
+                break;
+            }
+            case Op::Neg: {
+                st[sp - 1].negate();
+                break;
+            }
+            case Op::Add: {
+                PolySum b = st[sp - 1];
+                st[sp - 2].add(b, +1.0);
+                sp--;
+                break;
+            }
+            case Op::Sub: {
+                PolySum b = st[sp - 1];
+                st[sp - 2].add(b, -1.0);
+                sp--;
+                break;
+            }
+            case Op::Mul: {
+                PolySum b = st[sp - 1];
+                if (!st[sp - 2].mul(b)) return false;
+                sp--;
+                break;
+            }
+            case Op::Div: {
+                PolySum b = st[sp - 1];
+                if (!st[sp - 2].div(b)) return false;
+                sp--;
+                break;
+            }
+            case Op::PowC: {
+                if (!st[sp - 1].powC(in.num)) return false;
+                break;
+            }
+            case Op::Sqrt: {
+                if (!st[sp - 1].powC(0.5)) return false;
+                break;
+            }
             case Op::Abs: {
-                PolySum a = pop();
-                if (a.t.size() > 1) return false;
-                if (a.t.size() == 1) {
-                    if (a.t[0].second < 0.0) a.t[0].second = -a.t[0].second;
-                }
-                st.push_back(std::move(a));
+                PolySum& a = st[sp - 1];
+                if (a.n > 1) return false;
+                if (a.n == 1 && a.a[0] < 0.0) a.a[0] = -a.a[0];
                 break;
             }
             default:  // PowGen, Exp, Ln, Sgn, Sin, Cos, Tan, Atan
                 return false;
         }
     }
-    if (st.size() != 1) return false;
-    terms = st[0].t;
-    for (const auto& e : terms)
-        if (!std::isfinite(e.first) || !std::isfinite(e.second)) return false;
+    if (sp != 1) return false;
+    PolySum& r = st[0];
+    if (r.n > cap) return false;
+    for (int i = 0; i < r.n; i++) {
+        if (!gs_isfinite(r.p[i]) || !gs_isfinite(r.a[i])) return false;
+        outP[i] = r.p[i];
+        outA[i] = r.a[i];
+    }
+    n = r.n;
     return true;
 }
 
 bool Expr::triviallyConstant() const {
-    return ok_ && prog_.size() == 1 && prog_[0].op == Op::PushConst;
+    return ok_ && progLen_ == 1 && prog_[0].op == Op::PushConst;
 }
 
 }  // namespace grav

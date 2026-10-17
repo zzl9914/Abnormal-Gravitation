@@ -15,9 +15,15 @@
 ## 快速开始
 
 ```bat
-build.bat        :: 编译内核 DLL + 测试程序（需要 g++）
-run.bat          :: 启动服务器 → 浏览器打开 http://127.0.0.1:8123
+build_wasm.bat   :: 把 core/*.cpp 编译成 freestanding wasm32（需要 clang，支持 --target=wasm32）
+start.bat        :: 启动静态服务器 → 浏览器打开 http://127.0.0.1:8123
 ```
+
+浏览器里 **JS 直接调用 wasm 内核**：没有 Python、没有 HTTP 接口、没有 SSE、没有 JSON 帧——
+状态帧是 wasm 内存上的 `Float64Array` 视图（零拷贝）。wasm 以 base64 内联在
+`web/gravity_wasm.js` 里，页面加载时零 fetch。
+
+原生侧（测试 / 基准 / 可选 DLL）用 `build.bat`（需要 g++）。
 
 内核正确性测试：`bin\gs_test.exe`（**63 项**断言：圆轨道能量守恒 ~1e-12、各向异性度量下力的方向/幅值与**角动量严格守恒**（T12，1e-15）、V 从 F 的解析/数值反积分、单位球形状、并合动量守恒、弹性反弹、穿核正则化、三体 8 字、**暗物质晕（钉住天体）**、Barnes-Hut 树精度与积分健康等）。
 
@@ -36,13 +42,19 @@ core/    C++17 内核
                 Barnes-Hut 四叉/八叉树（θ 判据用度量距离 mrad < θ·d 表述；
                 碰撞检测用「点到盒的度量距离下界」剪枝）
   bench_main.cpp  性能基准
-  api.cpp       C ABI（ctypes 消费）
-server/  Python stdlib 服务器（无第三方依赖）
-  core_wrap.py  ctypes 封装
-  server.py     ThreadingHTTPServer：静态托管 + SSE 状态流 + POST 控制
-                （每 tick 墙钟预算 70%：高倍率超 CPU 能力时优雅降级，
-                能量计算降频缓存，SSE 帧率随 N 分级 30/12/8 Hz）
-web/     单文件前端（无构建、无 CDN），Hash 2D-CAM 风格 UI
+  test_main.cpp   断言测试（63 项）
+  api.cpp       C ABI（gs_*）：原生侧给 FFI 用，wasm 侧给 JS 用，同一套符号
+  gsmath.h/.cpp 数学抽象层：gs_pow/gs_log/... 原生用 libm，wasm 由 JS 的
+                Math.* 提供；sqrt/fabs/copysign 走编译器内建（wasm 原生指令）
+  gsstr.h/gsrt_wasm.cpp  最小字符工具 / freestanding 运行时（memcpy 等）
+  ⚠ 内核是 freestanding 的：无 STL 容器、无 std::string、无 new/delete
+web/     前端（无构建、无 CDN），Hash 2D-CAM 风格 UI
+  gravity_wasm.js  由 web/tools/build-kernel.js 生成：wasm 的 base64 内联版
+  gravity.js       JS ↔ 内核桥接：零拷贝状态帧、setup/control/标定、
+                   rAF tick 循环（每 tick 墙钟预算 70%，自适应分批）
+  tools/build-kernel.js  clang --target=wasm32 -nostdlib → wasm → base64 JS
+  tools/serve.js   极简静态服务器（只托管文件，没有业务逻辑）
+  tools/check-bridge.js  桥接层自检（Node，无需浏览器）：19 项检查
   index.html  主页：可收起半透明「初始条件」设置浮层 + 右下运行控制台 dock +
               左上 HUD。距离度量 f 预设 5 个（t^0.5 / t / t^2 / t^3 / t^10）、
               力律 F 预设 4 个（r / 1/r / 1/r² / 1/r⁶−1/r¹²），
@@ -57,9 +69,42 @@ web/     单文件前端（无构建、无 CDN），Hash 2D-CAM 风格 UI
   度量单位球叠加、V(r)=∫F 曲线、能量监视、拖尾（大 N 自适应缩短）
 ref/     实现说明：表达式引擎与符号分解、度量反演（幂快路径 / safeguarded
          Newton）、派生势（解析反积分 / 数值表）、Verlet、碰撞三模式、
-         Barnes-Hut 不变量与剪枝、服务端 tick 预算、改动禁忌与验证方式
-         —— 面向要改代码的人，见 ref/implementation.md
+         Barnes-Hut 不变量与剪枝、freestanding 约束与 wasm 对接、
+         改动禁忌与验证方式 —— 面向要改代码的人，见 ref/implementation.md
 ```
+
+## 内核是怎样被 JS 调用的
+
+```
+core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm
+                                                      │ base64
+                                                      ▼
+                                            web/gravity_wasm.js
+                                                      │ new WebAssembly.Instance
+                                                      ▼
+   index.html / three.html ──▶ web/gravity.js ──▶ gs_create / gs_step / gs_state_fill …
+                                     ▲
+                                     └── 状态帧 = Float64Array 视图，指向 wasm 内存（零拷贝）
+```
+
+- 数学函数 `gs_pow / gs_log / gs_exp / gs_sin / gs_cos / gs_tan / gs_atan`
+  在 wasm 里是 **import**，由 JS 用 `Math.*` 提供；`sqrt / fabs / copysign`
+  用编译器内建直接落到 wasm 原生指令，不进 import 表。
+- 字符串与 double 数组参数先写进内核的静态暂存区（`gs_str_buf()` /
+  `gs_dscratch()`），再把指针传给 `gs_*`——wasm 侧没有 malloc。
+- 固定容量上限：**天体数 4096**（`kMaxBodies`）、树节点 16384；
+  前端的生成上限本来就是 4000，正好落在范围内。
+- 物理 tick 仍按 30 Hz 推进（不是渲染帧率），每 tick 步数 = 子步数 × 倍率，
+  并按墙钟预算 0.7×间隔分批下发；CPU 跟不上时优雅降级为「能跑多快跑多快」。
+
+实测（同一台机器，2D，f=t²，F=1/r²，树 θ=0.6）：
+
+| 场景             | 原生 -O2（g++） | wasm -O3（clang，浏览器/Node） |
+| -------------- | ----------- | ------------------------ |
+| N = 2000，树    | 23.4 ms/步   | **11.0 ms/步**            |
+| N = 4000，树    | 52.2 ms/步   | —                        |
+
+wasm 比原生 -O2 还快，主要来自 clang -O3 与固定容量数组（去掉了 STL 容器的间接层）。
 
 ## 物理约定
 
@@ -74,7 +119,7 @@ R=10、F=1/r²、G=1 的配置）。换力律或盘半径后重新「应用」�
 任何配置下随机云半半径处的力都与默认配置相同，演化时标可比。  
 随机云的圆速度随之按力律实际形状初始化：v = √(G·m_enc·F(r)·r)  
 （对任意力律的圆轨道解；F=1/r² 时退化为 √(G·m_enc/r)）。  
-/api/calibrate 返回标定后的 G 与 F 的 64 点采样表，前端按对数插值求 F(r)。
+`Gravity.calibrate()` 返回标定后的 G 与 F 的 64 点采样表，前端按对数插值求 F(r)。
 
 检验：f=t²、F=1/r² 时严格退化为牛顿引力 a = mⱼ·Δ/d³。  
 F = 1/r → V = ln r（平坦旋转曲线）；F = r → V = r²/2（胡克弹簧）；  
@@ -163,17 +208,24 @@ F = 1/r⁶−1/r¹² → V = −1/(5r⁵)+1/(11r¹¹)（Lennard-Jones）。
 能量会跳变；N ≥ 1500 自动启用的树有 ~0.4% 力噪声，都会加快弛豫。  
 需要精度时减小 dt / θ。
 
-## API 摘要
+## API 摘要（web/gravity.js）
 
-- `POST /api/setup` — 全量重建（f/F/dims/collision/density/dt/substeps/speed/tree/theta/bodies；  
+没有 HTTP 接口了 —— 这些都是**同进程内的 JS 调用**：
+
+- `await Gravity.ready()` — 实例化 wasm（页面启动时调用一次）
+- `Gravity.setup(cfg)` — 全量重建：`f/F/dims/collision/density/dt/substeps/speed/tree/theta/bodies`；  
   `F` 为力律表达式，F>0 吸引；`G` 显式耦合常数，或 `autoG` = 半半径自动标定；  
-  bodies 每项可带 `fixed:true` = 暗物质晕，钉住不动、不并合）
-- `POST /api/calibrate` — `{F, r, rs?}` → `{g, fs?}`：返回满足 G·F(r)=0.04 的 G，  
-  及 F 在采样半径 rs 上的取值表（前端建云用）
-- `POST /api/control` — running / dt / substeps / speed / tree / theta / stepOnce / G
-- `POST /api/reset` — 按最近配置重建
-- `GET /api/stream` — SSE 帧流（30 Hz；N ≥ 1500 降为 12 Hz，N ≥ 3000 降为 8 Hz）
-- `GET /api/state` / `GET /api/analysis`（派生 V(r) 采样 + 单位球）  
-  — state.bodies 为平铺数组，每体 8 个数：`[m, x, y, z, vx, vy, vz, flags]`  
+  bodies 每项可带 `fixed:true` = 暗物质晕，钉住不动、不并合 → `{ok, error}`
+- `Gravity.control(cmd)` — `running / dt / substeps / speed / tree / theta / G / stepOnce`
+- `Gravity.reset()` — 按最近配置重建
+- `Gravity.calibrate({F, r, rs})` → `{g, fs}`：满足 G·F(r)=0.04 的 G，及 F 的采样表
+- `Gravity.analysis()` → `{potR, potV, ball}`：派生 V(r) 采样 + 度量单位球
+- `Gravity.sim` — 快照 `{t, n, e, e0, bodies, running, error, G}`，其中 `bodies` 是  
+  **wasm 内存上的 Float64Array 视图**，每体 8 个数：`[m, x, y, z, vx, vy, vz, flags]`  
   （2D 补零；flags bit0 = 钉住的暗物质晕）
+- `Gravity.onFrame = fn` / `Gravity.start()` — 每渲染帧回调（替代原来的 SSE）
 - 参数：`speed` ∈ [0.25, 64]；`tree` 0=自动 1=关闭；`theta` ∈ [0.05, 1.5]
+
+底层的 C ABI（`core/api.cpp`，原生 FFI 同样可用）：`gs_create / gs_create_probe /
+gs_configure / gs_set_G / gs_set_tree / gs_add_body_ex / gs_step / gs_count /
+gs_energy / gs_state_fill / gs_analysis / gs_ball / gs_force_at / gs_last_error`。
