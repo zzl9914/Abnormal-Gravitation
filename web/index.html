@@ -22,6 +22,9 @@ button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
 ::selection{background:rgba(57,255,20,.28)}
 
+/* 粒子层（WebGL2）：在 2D 画布**下面**，2D 画布仍负责网格/拖尾/HUD/单位球 */
+#glcv{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+body.is-settings #glcv{opacity:.34}
 #cv{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
 #cv.drag{cursor:grabbing}
 body.is-settings #cv{opacity:.34}
@@ -137,9 +140,13 @@ canvas.mini{width:264px;background:var(--panel2);border:1px solid var(--line);bo
 #errbar{position:absolute;left:50%;transform:translateX(-50%);bottom:10px;max-width:60%;
   background:rgba(46,0,8,.9);color:var(--err);border:1px solid #6a4038;border-radius:8px;
   padding:6px 10px;font-size:12px;display:none;white-space:pre-wrap;z-index:7}
+/* 数值稳定性提示（核内刚性 ω·dt） */
+#warnbar{background:rgba(48,38,0,.92);color:#ffd479;border:1px solid #6b5a1e;border-radius:10px;
+  padding:8px 10px;font-size:11.5px;line-height:1.5;margin-top:8px;display:none;white-space:normal}
 </style>
 </head>
 <body>
+<canvas id="glcv"></canvas>
 <canvas id="cv" aria-label="模拟画布。拖动平移（2D）或旋转（3D），滚轮缩放。"></canvas>
 
 <div class="hud" id="hud">
@@ -281,6 +288,7 @@ canvas.mini{width:264px;background:var(--panel2);border:1px solid var(--line);bo
       <p class="hint">暗物质晕：固定于原点、永不移动、不参与并合（紫色），但对所有质点施加全部引力；反弹模式下表现为不可推动的弹性壁。</p>
       <button class="btn primary" id="apply" type="button">应用 / 重建模拟</button>
       <div class="status" id="applyStatus"></div>
+      <div id="warnbar"></div>
     </section>
 
     <section aria-labelledby="hVis">
@@ -332,11 +340,15 @@ const F_PRESETS = [
  { v:'t^3',   name:'t^3 · 立方度量 L³（内凹方形单位球）',   dt:5e-4, sub:6 },
  { v:'t^10',  name:'t^10 · 尖锐度量 L¹⁰（近正方形单位球）', dt:5e-4, sub:6 },
 ];
+// ⚠ 预设可以带 `rho`（= log10 ρ，对应 #density 滑块）：短程陡峭的力律（LJ / 1/r¹²）
+//   在默认 ρ=100（半径 ≈0.056）下核内刚度 ω=√(F(R)/R) 可达 1e8，ω·dt≫2 必然指数发散
+//   （实测 R 从 8.16 暴涨到 1e5、E 变 +1e18，树覆盖巨大动态范围还会慢 3×）。
+//   把半径放大 10 倍（ρ=1）即回到稳定区（ω·dt ≈ 0.01）。
 const V_PRESETS = [
  { v:'r',            name:'r · 胡克弹簧（吸引力随距离线性增大）',        dt:1e-3, sub:4 },
  { v:'1/r',          name:'1/r · 对数势型（平坦旋转曲线）',              dt:1e-3, sub:4 },
  { v:'1/r^2',        name:'1/r² · 牛顿/库仑反比（默认）',                dt:2e-3, sub:4 },
- { v:'1/r^6-1/r^12', name:'1/r⁶ − 1/r¹² · Lennard-Jones（近排斥远吸引）', dt:2e-4, sub:8 },
+ { v:'1/r^6-1/r^12', name:'1/r⁶ − 1/r¹² · Lennard-Jones（近排斥远吸引）', dt:2e-4, sub:8, rho:0 },
 ];
 const CUSTOM = '__custom__';   // 表达式不匹配任何预设时的显示态
 for(const [sel, arr] of [['fPreset', F_PRESETS], ['vPreset', V_PRESETS]]){
@@ -373,7 +385,11 @@ $('fPreset').onchange = () => {
 $('vPreset').onchange = () => {
   const p = V_PRESETS.find(x => x.v === $('vPreset').value); if(!p) return;
   $('vExpr').value = p.v; syncPreset('vPreset', V_PRESETS, p.v);
-  setDtSub(p.dt, p.sub); applySetup(true);
+  setDtSub(p.dt, p.sub);
+  if(p.rho !== undefined){          // 短程陡峭的力律顺带把密度（半径）调到稳定区
+    $('density').value = p.rho; $('density').oninput();
+  }
+  applySetup(true);
 };
 $('fExpr').addEventListener('input', () => syncPreset('fPreset', F_PRESETS, $('fExpr').value));
 $('vExpr').addEventListener('input', () => syncPreset('vPreset', V_PRESETS, $('vExpr').value));
@@ -459,10 +475,35 @@ async function applySetup(showOk){
     st.textContent='已重建 ✓';st.className='status ok';
     energies=[]; trails.data=[];
     fetchAnalysis();
+    stabilityHint();
   }else{
     st.textContent='✗ '+res.error;st.className='status bad';
+    $('warnbar').style.display='none';
   }
   return res.ok;
+}
+// 核内刚性自检：ω = √(G·|F(R)|/R)（R 由密度导出），ω·dt > 2 时 Verlet 必炸。
+// 实测：F=1/r¹² + ρ=100（R≈0.056）→ ω·dt ≈ 1e4，5 步内 R 从 8.16 涨到 1e5、E 翻正。
+function stabilityHint(){
+  const n=sim.n, el=$('warnbar');
+  if(!n){ el.style.display='none'; return; }
+  try{
+    const b=Gravity.sim.bodies;
+    const ms=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/64))) ms.push(b[8*i]);
+    ms.sort((x,y)=>x-y);
+    const m=ms[Math.floor(ms.length/2)] || 1;      // 质量中位数
+    const R=physRadiusFn()(m);
+    const dt=Math.pow(10,+$('dt').value), G=(+Gravity.sim.G>0)?+Gravity.sim.G:1;
+    if(!(R>0)){ el.style.display='none'; return; }
+    const F=Math.abs(Gravity.forceAt(R));
+    const omega=Math.sqrt(G*F/R);
+    const x=omega*dt;
+    if(x>2){
+      el.style.display='block';
+      el.textContent=`⚠ 核内刚性发散风险：ω·dt = ${x.toExponential(1)} ≫ 2（R=${R.toPrecision(3)}，F(R)=${F.toExponential(2)}）`+
+        `——建议 dt < ${(2/omega).toExponential(1)}，或把密度 ρ 调小让半径变大（放大 10 倍半径可降 100×）。`;
+    }else el.style.display='none';
+  }catch(e){ el.style.display='none'; }
 }
 function fetchAnalysis(){
   try{
@@ -541,12 +582,136 @@ function pushTrails(){
 }
 
 // ============================================================== canvas
-const cv=$('cv'), ctx=cv.getContext('2d');
+// ⚠ glcv 必须在这里声明：resize() 在下面立刻被调用，放到 GPU 段里会撞 TDZ
+const cv=$('cv'), ctx=cv.getContext('2d'), glcv=$('glcv');
 function resize(){
   const r=cv.parentElement ? cv.parentElement.getBoundingClientRect() : {width:innerWidth,height:innerHeight};
   cv.width=Math.round(innerWidth*devicePixelRatio); cv.height=Math.round(innerHeight*devicePixelRatio);
+  glcv.width=cv.width; glcv.height=cv.height;   // 粒子层与 2D 层像素严格对齐
 }
 addEventListener('resize',resize); resize();
+
+// ============================================================== GPU 粒子层（WebGL2）
+// 天体用 gl.POINTS 画：Canvas 2D 在 16384 体时每帧要画 3 万多个 arc（几十 ms），
+// GPU 路径只上传 3 个 Float32 缓冲 + 一次 drawArrays。10⁷ 目标下这层是必需品。
+const gpu={ok:false, gl:null, prog:null, cap:0, maxPt:64,
+           xy:null, sz:null, col:null, xs:null, ys:null, rs:null, cs:null};
+(function initGL(){
+  let gl=null;
+  try{ gl=glcv.getContext('webgl2',{alpha:true,antialias:false,premultipliedAlpha:false,depth:false}); }catch(e){ gl=null; }
+  if(!gl) return;
+  const vsrc=`#version 300 es
+  in vec2 aXY; in float aSize; in vec4 aColor;
+  uniform vec2 uRes;
+  out vec4 vColor;
+  void main(){
+    vec2 p=(aXY/uRes)*2.0-1.0;
+    gl_Position=vec4(p.x,-p.y,0.0,1.0);
+    gl_PointSize=aSize;
+    vColor=aColor;
+  }`;
+  const fsrc=`#version 300 es
+  precision mediump float;
+  in vec4 vColor; out vec4 outColor;
+  void main(){
+    // 复刻 2D 画法：实心核（半径 = 点的 1/1.9）+ 外面 16% 的淡光晕
+    vec2 d=gl_PointCoord-0.5; float r2=dot(d,d);
+    float core=smoothstep(0.075,0.055,r2);
+    float halo=0.16*smoothstep(0.25,0.06,r2);
+    float a=max(core,halo);
+    if(a<=0.003) discard;
+    outColor=vec4(vColor.rgb, vColor.a*a);
+  }`;
+  function sh(type,src){
+    const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){ console.warn('shader:',gl.getShaderInfoLog(s)); return null; }
+    return s;
+  }
+  const v=sh(gl.VERTEX_SHADER,vsrc), f=sh(gl.FRAGMENT_SHADER,fsrc);
+  if(!v||!f) return;
+  const p=gl.createProgram(); gl.attachShader(p,v); gl.attachShader(p,f); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){ console.warn('link:',gl.getProgramInfoLog(p)); return; }
+  gpu.gl=gl; gpu.prog=p;
+  gpu.aXY=gl.getAttribLocation(p,'aXY'); gpu.aSize=gl.getAttribLocation(p,'aSize');
+  gpu.aColor=gl.getAttribLocation(p,'aColor'); gpu.uRes=gl.getUniformLocation(p,'uRes');
+  gpu.maxPt=(gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)||[1,64])[1];
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0,0,0,0);
+  gpu.ok=true;
+})();
+function gpuEnsure(n){
+  if(n<=gpu.cap) return true;
+  const cap=Math.max(1024, n*2);
+  const gl=gpu.gl;
+  gpu.xy=gl.createBuffer(); gpu.sz=gl.createBuffer(); gpu.col=gl.createBuffer();
+  for(const [b,bytes] of [[gpu.xy,cap*8],[gpu.sz,cap*4],[gpu.col,cap*16]]){
+    gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.DYNAMIC_DRAW);
+  }
+  gpu.xs=new Float32Array(cap*2); gpu.ys=null;
+  gpu.rs=new Float32Array(cap); gpu.cs=new Float32Array(cap*4);
+  gpu.cap=cap;
+  return true;
+}
+// HSL → RGB（0..1），与 massColor 的色相/亮度一致
+function massRGB(m,out,base){
+  const l=Math.log10(Math.max(m,0.01));
+  const t=Math.max(0,Math.min(1,(l+1.5)/4.5));
+  const h=(200-t*170)/360, s=0.78, li=0.60-t*0.10;
+  const c=(1-Math.abs(2*li-1))*s, hp=h*6, x=c*(1-Math.abs(hp%2-1));
+  let r=0,g=0,b=0;
+  if(hp<1){r=c;g=x;} else if(hp<2){r=x;g=c;} else if(hp<3){g=c;b=x;}
+  else if(hp<4){g=x;b=c;} else if(hp<5){r=x;b=c;} else {r=c;b=x;}
+  const mm=li-c/2;
+  out[base]=r+mm; out[base+1]=g+mm; out[base+2]=b+mm;
+}
+const HALO_RGB=[0.690,0.424,1.0];   // #b06cff
+
+// 把天体填进 GPU 缓冲并一次画出；不可用返回 false → 调用方回退到 Canvas 2D。
+// ⚠ 半径/颜色/尺寸分级必须和 2D 路径完全一致，否则切换时观感会跳变。
+function drawBodiesGPU(b,n,wSize,floor,wGlow,physR){
+  if(!gpu.ok || !gpuEnsure(n)) return false;
+  const xs=gpu.xs, rs=gpu.rs, cs=gpu.cs;
+  let k=0;
+  if(view.mode==='2d'){
+    for(let i=0;i<n;i++){
+      const m=b[8*i], s=w2s(b[8*i+1],b[8*i+2]);
+      xs[2*k]=s[0]; xs[2*k+1]=s[1];
+      rs[k]=Math.max(floor, wSize*massRadius(m)+(1-wSize)*physR(m)*view.scale);
+      if(b[8*i+7]&1){ cs[4*k]=HALO_RGB[0];cs[4*k+1]=HALO_RGB[1];cs[4*k+2]=HALO_RGB[2]; }
+      else massRGB(m,cs,4*k);
+      cs[4*k+3]=1; k++;
+    }
+  }else{
+    for(let i=0;i<n;i++){
+      const p=project3(b[8*i+1],b[8*i+2],b[8*i+3]); if(!p) continue;
+      const m=b[8*i], ps=p[3]/p[2], depth=Math.max(0.5,Math.min(1.6,ps));
+      xs[2*k]=p[0]; xs[2*k+1]=p[1];
+      rs[k]=Math.max(floor, wSize*(massRadius(m)*depth*0.75)+(1-wSize)*physR(m)*ps);
+      if(b[8*i+7]&1){ cs[4*k]=HALO_RGB[0];cs[4*k+1]=HALO_RGB[1];cs[4*k+2]=HALO_RGB[2]; }
+      else massRGB(m,cs,4*k);
+      cs[4*k+3]=1; k++;
+    }
+  }
+  const gl=gpu.gl;
+  gl.viewport(0,0,glcv.width,glcv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if(!k) return true;
+  // gl_PointSize 是**直径**：核占 1/1.9，外面是光晕（与 2D 的 r*(1+0.9*w) 对应）
+  const maxD=Math.max(2, Math.min(gpu.maxPt, 128));
+  for(let i=0;i<k;i++) rs[i]=Math.max(1.0, Math.min(maxD, rs[i]*2*(1+0.9*wGlow)));
+  gl.useProgram(gpu.prog);
+  gl.uniform2f(gpu.uRes, glcv.width, glcv.height);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gpu.xy); gl.bufferSubData(gl.ARRAY_BUFFER,0,gpu.xs,0,k*2);
+  gl.enableVertexAttribArray(gpu.aXY); gl.vertexAttribPointer(gpu.aXY,2,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gpu.sz); gl.bufferSubData(gl.ARRAY_BUFFER,0,gpu.rs,0,k);
+  gl.enableVertexAttribArray(gpu.aSize); gl.vertexAttribPointer(gpu.aSize,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gpu.col); gl.bufferSubData(gl.ARRAY_BUFFER,0,gpu.cs,0,k*4);
+  gl.enableVertexAttribArray(gpu.aColor); gl.vertexAttribPointer(gpu.aColor,4,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.POINTS,0,k);
+  return true;
+}
 
 let drag=null;
 cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};cv.classList.add('drag');cv.setPointerCapture(e.pointerId);});
@@ -682,6 +847,8 @@ function draw3DAxes(){
 
 function render(){
   ctx.clearRect(0,0,cv.width,cv.height);
+  // 粒子层每帧清空：若这一帧走 Canvas 2D 回退，必须让上一帧的 GPU 点消失
+  if(gpu.ok){ gpu.gl.viewport(0,0,glcv.width,glcv.height); gpu.gl.clear(gpu.gl.COLOR_BUFFER_BIT); }
   const b=sim.bodies, n=Math.floor(b.length/8);
   const wSize=sizeWeight(n), floor=sizeFloor(n), wGlow=glowWeight(n), physR=physRadiusFn();
   if(view.mode==='2d'){
@@ -698,14 +865,16 @@ function render(){
       }
       ctx.stroke();ctx.globalAlpha=1;
     }
-    for(let i=0;i<n;i++){
-      const m=b[8*i], x=b[8*i+1], y=b[8*i+2], fl=b[8*i+7]|0;
-      const s=w2s(x,y);
-      // 像素尺寸 ⇄ 真实半径（真实半径 × view.scale 换算成像素）
-      const r=Math.max(floor, wSize*massRadius(m)+(1-wSize)*physR(m)*view.scale);
-      ctx.fillStyle=bodyColor(m,fl);
-      if(wGlow>0){ ctx.globalAlpha=0.16; ctx.beginPath();ctx.arc(s[0],s[1],r*(1+0.9*wGlow),0,6.283);ctx.fill(); }
-      ctx.globalAlpha=1; ctx.beginPath();ctx.arc(s[0],s[1],r,0,6.283);ctx.fill();
+    if(!drawBodiesGPU(b,n,wSize,floor,wGlow,physR)){
+      for(let i=0;i<n;i++){
+        const m=b[8*i], x=b[8*i+1], y=b[8*i+2], fl=b[8*i+7]|0;
+        const s=w2s(x,y);
+        // 像素尺寸 ⇄ 真实半径（真实半径 × view.scale 换算成像素）
+        const r=Math.max(floor, wSize*massRadius(m)+(1-wSize)*physR(m)*view.scale);
+        ctx.fillStyle=bodyColor(m,fl);
+        if(wGlow>0){ ctx.globalAlpha=0.16; ctx.beginPath();ctx.arc(s[0],s[1],r*(1+0.9*wGlow),0,6.283);ctx.fill(); }
+        ctx.globalAlpha=1; ctx.beginPath();ctx.arc(s[0],s[1],r,0,6.283);ctx.fill();
+      }
     }
   }else{
     draw3DAxes();
@@ -722,19 +891,22 @@ function render(){
       }
       ctx.stroke();ctx.globalAlpha=1;
     }
-    const proj=[];
-    for(let i=0;i<n;i++){
-      const p=project3(b[8*i+1],b[8*i+2],b[8*i+3]);
-      if(p) proj.push([p[0],p[1],p[2],p[3],b[8*i],i]);
-    }
-    proj.sort((a,b)=>b[2]-a[2]);
-    for(const [sx,sy,sz,f,m,i] of proj){
-      const depth=Math.max(0.5,Math.min(1.6,f/sz));
-      // 3D：真实半径按透视 f/sz 换算成像素（与像素尺寸同一套缩放）
-      const r=Math.max(floor, wSize*(massRadius(m)*depth*0.75)+(1-wSize)*physR(m)*(f/sz));
-      ctx.fillStyle=bodyColor(m, b[8*i+7]|0);
-      if(wGlow>0){ ctx.globalAlpha=0.15;ctx.beginPath();ctx.arc(sx,sy,r*(1+0.9*wGlow),0,6.283);ctx.fill(); }
-      ctx.globalAlpha=1;ctx.beginPath();ctx.arc(sx,sy,r,0,6.283);ctx.fill();
+    if(!drawBodiesGPU(b,n,wSize,floor,wGlow,physR)){
+      // 只有回退到 2D 时才需要按深度排序（GPU 点精灵无深度测试，顺序无所谓）
+      const proj=[];
+      for(let i=0;i<n;i++){
+        const p=project3(b[8*i+1],b[8*i+2],b[8*i+3]);
+        if(p) proj.push([p[0],p[1],p[2],p[3],b[8*i],i]);
+      }
+      proj.sort((a,b)=>b[2]-a[2]);
+      for(const [sx,sy,sz,f,m,i] of proj){
+        const depth=Math.max(0.5,Math.min(1.6,f/sz));
+        // 3D：真实半径按透视 f/sz 换算成像素（与像素尺寸同一套缩放）
+        const r=Math.max(floor, wSize*(massRadius(m)*depth*0.75)+(1-wSize)*physR(m)*(f/sz));
+        ctx.fillStyle=bodyColor(m, b[8*i+7]|0);
+        if(wGlow>0){ ctx.globalAlpha=0.15;ctx.beginPath();ctx.arc(sx,sy,r*(1+0.9*wGlow),0,6.283);ctx.fill(); }
+        ctx.globalAlpha=1;ctx.beginPath();ctx.arc(sx,sy,r,0,6.283);ctx.fill();
+      }
     }
   }
   // HUD

@@ -218,6 +218,13 @@
 
   function round6(x) { return Math.round(x * 1e6) / 1e6; }
 
+  // 原始力律值 F(r)（不含 G）。前端用它做「核内刚性自检」：
+  // ω = √(G·|F(R)|/R)，ω·dt > 2 时 Verlet 在核内会指数发散。
+  function forceAt(r) {
+    if (!I || !handle) return NaN;
+    return I.gs_force_at(handle, +r);
+  }
+
   // G·F(r) = 0.04 的标定 + F 采样表（任意力律的近平衡建云用）
   function calibrate(opt) {
     var F = String((opt && opt.F) || '1/r^2');
@@ -321,6 +328,7 @@
     reset: reset,
     analysis: analysis,
     calibrate: calibrate,
+    forceAt: forceAt,
     start: start,
     stop: stop,
     refresh: refresh,

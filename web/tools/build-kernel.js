@@ -45,6 +45,11 @@ var args = [
   '-ffreestanding',
   '-fno-exceptions',
   '-fno-rtti',
+  // SIMD128 / bulk memory / 非陷阱浮点转换：让 LLVM 能用 f64x2 自动向量化
+  // （树遍历是指针追踪，向量化收益有限；真正的好处是给后续手写 SIMD 的力循环铺路）
+  '-msimd128',
+  '-mbulk-memory',
+  '-mnontrapping-fptoint',
   '-Wl,--no-entry',
   '-Wl,--allow-undefined',
   '-Wl,--export-memory',

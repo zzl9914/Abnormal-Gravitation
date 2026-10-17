@@ -141,6 +141,28 @@ def main():
         st = pg.evaluate('() => ({n: Gravity.sim.n, len: Gravity.sim.bodies.length})')
         check(st['n'] == 16384, 'index.html：滑块上限 16384 体全部建成（含晕不丢体）', 'n=%s' % st['n'])
         check(st['len'] == st['n'] * 8, 'index.html：16384 体状态帧 = n×8', 'len=%s' % st['len'])
+        # GPU 粒子层（WebGL2 点精灵）：要真的画出像素，且关掉后能回退到 Canvas 2D
+        gl = pg.evaluate('''() => {
+            const b = Gravity.sim.bodies, n = Math.floor(b.length / 8);
+            const ok = gpu.ok;
+            const drew = drawBodiesGPU(b, n, sizeWeight(n), sizeFloor(n), glowWeight(n), physRadiusFn());
+            const glc = gpu.gl, W = glcv.width, H = glcv.height;
+            const px = new Uint8Array(W * H * 4);
+            glc.readPixels(0, 0, W, H, glc.RGBA, glc.UNSIGNED_BYTE, px);   // 必须在同一帧内读
+            let cnt = 0; for (let i = 3; i < px.length; i += 4) if (px[i] > 8) cnt++;
+            gpu.ok = false;                       // 回退路径必须返回 false（而不是抛异常）
+            let fell = null;
+            try { fell = drawBodiesGPU(b, n, sizeWeight(n), sizeFloor(n), glowWeight(n), physRadiusFn()); }
+            catch (e) { fell = 'ERR ' + e.message; }
+            gpu.ok = ok;
+            return { ok: ok, drew: drew, painted: cnt, fallback: fell, maxPt: gpu.maxPt };
+        }''')
+        check(gl['ok'] is True and gl['drew'] is True, 'index.html：GPU 粒子层可用',
+              'maxPt=%s' % gl['maxPt'])
+        check(gl['painted'] > 1000, 'index.html：粒子层确实画出了像素',
+              '非透明像素=%s' % gl['painted'])
+        check(gl['fallback'] is False, 'index.html：无 WebGL 时回退 Canvas 2D（不抛异常）',
+              str(gl['fallback']))
         # 暂停 / 单步
         pg.click('#playBtn')
         pg.wait_for_timeout(300)
