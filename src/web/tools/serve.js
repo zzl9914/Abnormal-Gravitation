@@ -1,11 +1,11 @@
 'use strict';
 // 极简静态服务器（仿 Hash 2D-CAM）。
 //
-// 前端已经直连 wasm 内核，这里只负责把 web/ 托管出去——没有任何业务逻辑、
+// 前端已经直连 wasm 内核，这里只负责把 src/web/ 托管出去——没有任何业务逻辑、
 // 没有 SSE、没有 POST 接口。之所以还要一个服务器，是因为浏览器的
 // WebAssembly / module 安全策略不允许 file:// 直接加载。
 //
-//   node web/tools/serve.js [--port 8123]
+//   node src/web/tools/serve.js [--port 8123]
 
 var http = require('http');
 var fs = require('fs');

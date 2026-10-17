@@ -1,6 +1,6 @@
 'use strict';
 // 桥接层自检（Node，无需浏览器）：验证 wasm 内核 + gravity.js 的端到端行为。
-//   node web/tools/check-bridge.js
+//   node src/web/tools/check-bridge.js
 //
 // 覆盖：初始化、setup（含 fixed 晕）、标定 G、control、步进、状态帧、
 // analysis、reset、错误路径（非法 f / 非法 F）。

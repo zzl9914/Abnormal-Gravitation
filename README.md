@@ -15,13 +15,13 @@
 ## 快速开始
 
 ```bat
-build_wasm.bat   :: 把 core/*.cpp 编译成 freestanding wasm32（需要 clang，支持 --target=wasm32）
+build_wasm.bat   :: 把 src/core/*.cpp 编译成 freestanding wasm32（需要 clang，支持 --target=wasm32）
 start.bat        :: 启动静态服务器 → 浏览器打开 http://127.0.0.1:8123
 ```
 
 浏览器里 **JS 直接调用 wasm 内核**：没有 Python、没有 HTTP 接口、没有 SSE、没有 JSON 帧——
 状态帧是 wasm 内存上的 `Float64Array` 视图（零拷贝）。wasm 以 base64 内联在
-`web/gravity_wasm.js` 里，页面加载时零 fetch。
+`src/web/gravity_wasm.js` 里，页面加载时零 fetch。
 
 原生侧（测试 / 基准 / 可选 DLL）用 `build.bat`（需要 g++）。
 
@@ -32,7 +32,7 @@ start.bat        :: 启动静态服务器 → 浏览器打开 http://127.0.0.1:8
 ## 架构
 
 ```
-core/    C++17 内核
+src/core/    C++17 内核
   expr.*        表达式引擎：对偶数自动求导（值+导数一次求出），RPN 编译；
                 asPowerSum：把表达式分解为幂和 Σa·r^p（用于从 F 精确反积分出 V）
   sim.*         度量反演（幂函数走解析快路径，一般 f 走 safeguarded Newton）、
@@ -48,13 +48,13 @@ core/    C++17 内核
                 Math.* 提供；sqrt/fabs/copysign 走编译器内建（wasm 原生指令）
   gsstr.h/gsrt_wasm.cpp  最小字符工具 / freestanding 运行时（memcpy 等）
   ⚠ 内核是 freestanding 的：无 STL 容器、无 std::string、无 new/delete
-web/     前端（无构建、无 CDN），Hash 2D-CAM 风格 UI
-  gravity_wasm.js  由 web/tools/build-kernel.js 生成：wasm 的 base64 内联版
+src/web/     前端（无构建、无 CDN），Hash 2D-CAM 风格 UI
+  gravity_wasm.js  由 src/web/tools/build-kernel.js 生成：wasm 的 base64 内联版
   gravity.js       JS ↔ 内核桥接：零拷贝状态帧、setup/control/标定、
                    rAF tick 循环（每 tick 墙钟预算 70%，自适应分批）
   tools/build-kernel.js  clang --target=wasm32 -nostdlib → wasm → base64 JS
   tools/serve.js   极简静态服务器（只托管文件，没有业务逻辑）
-  tools/check-bridge.js  桥接层自检（Node，无需浏览器）：19 项检查
+  tools/check-bridge.js  桥接层自检（Node，无需浏览器）：21 项检查
   index.html  主页：可收起半透明「初始条件」设置浮层 + 右下运行控制台 dock +
               左上 HUD。距离度量 f 预设 5 个（t^0.5 / t / t^2 / t^3 / t^10）、
               力律 F 预设 5 个（r / 1/r / 1/r² / 汤川 e^(−r)(1+r)/r² / 1/r⁶−1/r¹²），
@@ -80,13 +80,13 @@ ref/     实现说明：表达式引擎与符号分解、度量反演（幂快�
 ## 内核是怎样被 JS 调用的
 
 ```
-core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm
+src/core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm
                                                       │ base64
                                                       ▼
-                                            web/gravity_wasm.js
+                                            src/web/gravity_wasm.js
                                                       │ new WebAssembly.Instance
                                                       ▼
-   index.html / three.html ──▶ web/gravity.js ──▶ gs_create / gs_step / gs_state_fill …
+   index.html / three.html ──▶ src/web/gravity.js ──▶ gs_create / gs_step / gs_state_fill …
                                      ▲
                                      └── 状态帧 = Float64Array 视图，指向 wasm 内存（零拷贝）
 ```
@@ -221,7 +221,7 @@ setup 之前先用探针估计 ω（按 F/ρ/维度/半径/质量谱缓存），
 能量会跳变；N ≥ 1500 自动启用的树有 ~0.4% 力噪声，都会加快弛豫。  
 需要精度时减小 dt / θ。
 
-## API 摘要（web/gravity.js）
+## API 摘要（src/web/gravity.js）
 
 没有 HTTP 接口了 —— 这些都是**同进程内的 JS 调用**：
 
@@ -240,6 +240,6 @@ setup 之前先用探针估计 ω（按 F/ρ/维度/半径/质量谱缓存），
 - `Gravity.onFrame = fn` / `Gravity.start()` — 每渲染帧回调（替代原来的 SSE）
 - 参数：`speed` ∈ [0.25, 64]；`tree` 0=自动 1=关闭；`theta` ∈ [0.05, 1.5]
 
-底层的 C ABI（`core/api.cpp`，原生 FFI 同样可用）：`gs_create / gs_create_probe /
+底层的 C ABI（`src/core/api.cpp`，原生 FFI 同样可用）：`gs_create / gs_create_probe /
 gs_configure / gs_set_G / gs_set_tree / gs_add_body_ex / gs_step / gs_count /
 gs_energy / gs_state_fill / gs_analysis / gs_ball / gs_force_at / gs_last_error`。

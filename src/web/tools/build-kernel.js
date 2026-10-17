@@ -1,8 +1,8 @@
 'use strict';
-// 把 core/ 编译成 freestanding wasm32，再 base64 内联成 JS。
+// 把 src/core/ 编译成 freestanding wasm32，再 base64 内联成 JS。
 // 仿 Hash 2D-CAM：产物只有两个文件，浏览器里零 fetch、零依赖。
 //
-//   node web/tools/build-kernel.js
+//   node src/web/tools/build-kernel.js
 //
 // 需要 clang 支持 --target=wasm32（MSYS2 UCRT64 自带）：
 //   D:\Program Files (x86)\msys64\ucrt64\bin\clang.exe
@@ -82,7 +82,7 @@ for (var i = 0; i < expected.length; i++) {
 var bytes = fs.readFileSync(wasm);
 var b64 = bytes.toString('base64');
 var js = [
-  '// 由 web/tools/build-kernel.js 从 core/*.cpp 生成，不要手改。',
+  '// 由 src/web/tools/build-kernel.js 从 src/core/*.cpp 生成，不要手改。',
   '// freestanding wasm32（clang -nostdlib），base64 内联，浏览器零 fetch。',
   'var GRAVITY_WASM_B64 = ' + JSON.stringify(b64) + ';',
   "if (typeof module === 'object' && module.exports) module.exports = GRAVITY_WASM_B64;",

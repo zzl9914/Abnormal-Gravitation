@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """两页 headless 冒烟：页面能加载 wasm 内核、能建模拟、能推进、无 JS 错误。
 
-    python web/tools/smoke_pages.py            # 需要已启动 http://127.0.0.1:8123
+    python src/web/tools/smoke_pages.py            # 需要已启动 http://127.0.0.1:8123
 """
 import sys
 import time
