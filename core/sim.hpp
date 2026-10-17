@@ -41,11 +41,14 @@ enum class Collision : int { Pass = 0, Merge = 1, Bounce = 2 };
 enum BodyFlag : unsigned { kFlagFixed = 1u };
 
 // 固定容量
+// ⚠ 容量 = wasm 内存预算：天体表 216B/体（×2 槽位）+ 树节点 264B/个 + 状态帧 64B/体，
+//   当前配置静态占用约 26MB，对应 build-kernel.js 的 --initial-memory=67108864。
+//   上调这些常量必须同步上调 initial-memory，否则 wasm 实例化直接失败。
 enum {
-    kMaxBodies = 4096,
-    kMaxNodes = 16384,
-    kMaxExtra = 2048,     // 深度上限处重合天体的溢出槽位
-    kMaxContacts = 4096,  // 单次收集的接触对上限
+    kMaxBodies = 16384,
+    kMaxNodes = 65536,    // ≈ 4×kMaxBodies：随机分布下实际用 1.3–2N，留余量给团簇
+    kMaxExtra = 8192,     // 深度上限处重合天体的溢出槽位
+    kMaxContacts = 16384, // 单次收集的接触对上限
     kTabN = 4096,         // 数值势表的点数
     kMaxPowTermsSim = 16
 };

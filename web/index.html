@@ -264,7 +264,9 @@ canvas.mini{width:264px;background:var(--panel2);border:1px solid var(--line);bo
     <section aria-labelledby="hInit">
       <h2 id="hInit">初始天体（随机云）</h2>
       <div class="row sliders">
-        <div class="field"><span>数量 N（对数刻度）</span><input type="range" id="genN" min="0.3" max="3.602" step="0.002" value="1.9"></div>
+        <!-- max 取 4.22（log10 16384 = 4.2144 的下一个 step 整数位）：滑块会吸附步进值，
+             若正好写 4.2144 会被吸到 4.214 → N=16368，拉不满；靠 genNCount 钳到 16384 -->
+        <div class="field"><span>数量 N（对数刻度，1 – 16384）</span><input type="range" id="genN" min="0" max="4.22" step="0.002" value="1.9"></div>
         <div class="field"><span>半径 R</span><input type="range" id="genR" min="1" max="30" step="0.5" value="10"></div>
       </div>
       <div class="row"><span class="val" id="genNVal">80</span><span class="val" id="genRVal">10.0</span></div>
@@ -390,7 +392,10 @@ function makeCloud(g, dims, cal){
   const bs=[];
   // 暗物质晕：固定在原点、不参与并合（fixed），仍施加全部引力
   if(g.m0>0) bs.push({mass:g.m0,pos:new Array(dims).fill(0),vel:new Array(dims).fill(0),fixed:true});
-  const mDisk=g.n*(g.mMin+g.mMax)/2;   // 盘自引力质量（均匀分布近似）
+  // ⚠ N 是**总天体数**（含暗物质晕）：滑块上限 16384 = kMaxBodies，
+  //   若把 N 当成盘天体数，开了晕就会是 16385 → 超出内核容量、最后一体静默丢失
+  const nDisk=Math.max(0, g.n - (g.m0>0?1:0));
+  const mDisk=nDisk*(g.mMin+g.mMax)/2;   // 盘自引力质量（均匀分布近似）
   const randMass=()=>g.mMin+Math.random()*(g.mMax-g.mMin);
   const randPos=()=>{
     if(dims===3){
@@ -403,7 +408,7 @@ function makeCloud(g, dims, cal){
     return [r*Math.cos(a), r*Math.sin(a)];
   };
   // 盘物质：圆速度计入包围质量（晕 + 内含盘质量），近平衡初始化
-  for(let i=0;i<g.n;i++){
+  for(let i=0;i<nDisk;i++){
     const pos=randPos(), m=randMass();
     let vel;
     if(dims===3){
@@ -794,7 +799,8 @@ $('density').oninput=()=>{
   $('densityVal').textContent=rho>=100?rho.toExponential(0):rho.toPrecision(3);
 };
 $('trail').oninput=()=>$('trailVal').textContent=$('trail').value;
-function genNCount(){ return Math.max(2, Math.min(4000, Math.round(Math.pow(10,+$('genN').value)))); }
+// ⚠ 上限必须与内核 kMaxBodies 一致（现为 16384），超限 addBody 会静默失败
+function genNCount(){ return Math.max(1, Math.min(16384, Math.round(Math.pow(10,+$('genN').value)))); }
 $('genN').oninput=()=>$('genNVal').textContent=genNCount();
 $('genR').oninput=()=>$('genRVal').textContent=(+$('genR').value).toFixed(1);
 $('genSpin').oninput=()=>$('genSpinVal').textContent=(+$('genSpin').value).toFixed(2);

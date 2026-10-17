@@ -256,7 +256,8 @@
     if (!handle) return;
     var n = I.gs_count(handle);
     snapCount++;
-    var cadence = n < 1000 ? 2 : 15;   // energy() 在大 N 很贵：降频
+    // energy() 在大 N 很贵（树重建 + PE 遍历）：N 越大降频越狠
+    var cadence = n < 1000 ? 2 : (n < 4000 ? 15 : 45);
     if (force || snapCount >= cadence) {
       snapCount = 0;
       sim.e = I.gs_energy(handle);

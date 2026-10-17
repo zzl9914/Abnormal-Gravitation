@@ -48,8 +48,9 @@ var args = [
   '-Wl,--no-entry',
   '-Wl,--allow-undefined',
   '-Wl,--export-memory',
-  // 静态缓冲：2 个 Simulation 槽位（天体表 + 势表）+ 共享树 + 状态缓冲，约 4MB
-  '-Wl,--initial-memory=8388608',
+  // 静态缓冲：2 个 Simulation 槽位（天体表 216B/体 ×16384）+ 树节点（264B ×65536）
+  // + 状态帧（64B/体），实测约 26MB → 给 64MB（改 kMaxBodies/kMaxNodes 必须同步改这里）
+  '-Wl,--initial-memory=67108864',
   '-Wl,--max-memory=268435456',
   // asPowerSum 的符号栈是栈上数组（~34KB），递归插入也要余量
   '-Wl,-zstack-size=1048576',

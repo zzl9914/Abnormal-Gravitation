@@ -95,6 +95,18 @@ def main():
         st = pg.evaluate('() => ({n: Gravity.sim.n, G: Gravity.sim.G, e: Gravity.sim.e})')
         check(st['n'] > 100, 'index.html：随机云已生成', 'n=%s G=%.4g' % (st['n'], st['G']))
         check(st['e'] < 0, 'index.html：随机云是束缚态（E<0）', 'E=%s' % st['e'])
+        # 滑块两端：下限 1、上限 16384（超 kMaxBodies 会静默丢体，只有数 n 才看得出）
+        pg.eval_on_selector('#genN', "el => { el.value = 0; el.dispatchEvent(new Event('input')); }")
+        pg.click('#genBtn')
+        pg.wait_for_timeout(1500)
+        n1 = pg.evaluate('() => Gravity.sim.n')
+        check(n1 == 1, 'index.html：滑块下限 N=1 可建立', 'n=%s' % n1)
+        pg.eval_on_selector('#genN', "el => { el.value = el.max; el.dispatchEvent(new Event('input')); }")
+        pg.click('#genBtn')
+        pg.wait_for_timeout(12000)
+        st = pg.evaluate('() => ({n: Gravity.sim.n, len: Gravity.sim.bodies.length})')
+        check(st['n'] == 16384, 'index.html：滑块上限 16384 体全部建成（含晕不丢体）', 'n=%s' % st['n'])
+        check(st['len'] == st['n'] * 8, 'index.html：16384 体状态帧 = n×8', 'len=%s' % st['len'])
         # 暂停 / 单步
         pg.click('#playBtn')
         pg.wait_for_timeout(300)

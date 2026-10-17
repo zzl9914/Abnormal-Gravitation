@@ -50,8 +50,10 @@ core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm（~5
 编译，因此：
 
 1. **不用 STL 容器**：没有 `std::vector` / `std::string` / `std::pair`。
-   一律固定容量数组 + 计数（`kMaxBodies = 4096`、`kMaxNodes = 16384`、
-   `kMaxExtra = 2048`、`kMaxContacts = 4096`、`kTabN = 4096`）。
+   一律固定容量数组 + 计数（`kMaxBodies = 16384`、`kMaxNodes = 65536`、
+   `kMaxExtra = 8192`、`kMaxContacts = 16384`、`kTabN = 4096`）。
+   ⚠ 这些常量直接决定静态内存占用（天体 216 B/体 ×2 槽位 + 树节点 264 B/个
+   + 状态帧 64 B/体 ≈ 26 MB），**改大必须同步改 `--initial-memory`**。
 2. **不用 `new` / `delete`**：`Simulation` 放在 `api.cpp` 的静态槽位数组里
    （slot 0 = 主模拟，slot 1 = 一次性探针）；句柄 = 槽位索引 + 1。
 3. **默认构造必须平凡**：所有成员都**没有**默认初始化器（否则会生成需要运行时
@@ -89,12 +91,12 @@ core/*.cpp ──clang --target=wasm32 -nostdlib──▶ gravity_core.wasm（~5
 ```
 --target=wasm32 -O3 -nostdlib -ffreestanding -fno-exceptions -fno-rtti
 -Wl,--no-entry -Wl,--allow-undefined -Wl,--export-memory
--Wl,--initial-memory=8388608 -Wl,--max-memory=268435456 -Wl,-zstack-size=1048576
+-Wl,--initial-memory=67108864 -Wl,--max-memory=268435456 -Wl,-zstack-size=1048576
 -Wl,--export=gs_create ...
 ```
 
 ⚠ 栈要 1 MB：`asPowerSum` 的符号栈是栈上数组（~34 KB），插入又是递归的。
-⚠ 原生侧反过来：`Simulation` 约 1 MB，测试里是**栈对象**，所以
+⚠ 原生侧反过来：`Simulation` 约 3.6 MB（天体表 216 B × 16384），测试里是**栈对象**，所以
 `gs_test.exe` / `gs_bench.exe` 链接时必须 `-Wl,--stack,67108864`（否则一启动就崩）。
 
 关键常量（`sim.cpp` / `sim.hpp`）：
@@ -402,7 +404,9 @@ acc += mj · w · delta
   拖拽定初速 + `localStorage`（键 `grav3body.scenes` / `grav3body.last`）+ JSON 导入导出。
 - **拖尾自适应**：N > 600 → 40，N > 1500 → 16，N > 3000 → 0
   （2500 体 × 240 拖尾曾把 headless 浏览器的渲染开销吃到 97 fps，反过来拖垮服务器）。
-- **genN 上限 4000**（内核 `getState` 缓冲 4096 体）。
+- **genN 范围 1 – 16384**（与内核 `kMaxBodies` 对齐；`getState` 缓冲同样按 16384 体开）。
+  ⚠ 改这个上限必须同时改 `kMaxBodies`/`kMaxNodes` 与 `--initial-memory`，否则
+  `addBody` 超限返回 −1、静默少建天体。
 
 ---
 

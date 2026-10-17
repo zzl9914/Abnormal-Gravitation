@@ -111,6 +111,34 @@ Gravity.ready().then(function () {
     console.log('      wasm 2000 体：' + ms.toFixed(1) + ' ms/步');
   }
 
+  // ---- 容量上限：N = kMaxBodies = 16384（前端 #genN 滑块上限）----
+  // ⚠ 这里必须建满：超限的 addBody 会返回 -1 而 setup 仍报 ok，只有数 n 才看得出来
+  var many = [];
+  for (var k = 0; k < 16384; k++) {
+    var a2 = 2 * Math.PI * (k / 16384), rad2 = 0.2 + 8 * Math.sqrt((k % 97) / 97);
+    many.push({ mass: 1, pos: [rad2 * Math.cos(a2), rad2 * Math.sin(a2)], vel: [0, 0] });
+  }
+  var cap = Gravity.setup({
+    dims: 2, f: 't^2', F: '1/r^2', collision: 0, density: 100,
+    dt: 1e-4, substeps: 1, tree: 0, theta: 0.6, bodies: many, running: false
+  });
+  check(cap.ok && Gravity.sim.n === 16384, '16384 体（滑块上限）全部建成',
+        (cap.error || '') + ' n=' + Gravity.sim.n);
+  if (cap.ok && Gravity.sim.n === 16384) {
+    var t2 = G.performance.now();
+    for (var s2 = 0; s2 < 3; s2++) Gravity.control({ stepOnce: true });
+    var ms2 = (G.performance.now() - t2) / 3;
+    console.log('      wasm 16384 体：' + ms2.toFixed(1) + ' ms/步');
+  }
+  // ---- 下限：N = 1 ----
+  var one = Gravity.setup({
+    dims: 2, f: 't^2', F: '1/r^2', collision: 0, density: 100,
+    dt: 1e-4, substeps: 1, tree: 0, theta: 0.6,
+    bodies: [{ mass: 1, pos: [0, 0], vel: [0, 0] }], running: false
+  });
+  check(one.ok && Gravity.sim.n === 1, 'N=1（滑块下限）可建立',
+        (one.error || '') + ' n=' + Gravity.sim.n);
+
   console.log('\n' + (fail === 0 ? 'ALL CHECKS PASSED' : fail + ' CHECK(S) FAILED') +
               '  (' + pass + ' passed, ' + fail + ' failed)');
   process.exit(fail === 0 ? 0 : 1);
