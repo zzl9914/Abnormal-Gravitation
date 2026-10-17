@@ -31,6 +31,13 @@ def run(page, url, label, min_bodies):
         err: document.getElementById('errbar') ? document.getElementById('errbar').textContent : ''
     })''')
     check(st['n'] >= min_bodies, '%s：天体已建立' % label, 'n=%s' % st['n'])
+    if label == 'index.html':
+        # 开局默认 = 128 体随机云（滑块也必须是 128，否则改了体数复现不出来）
+        check(st['n'] == 128, 'index.html：开局默认 = 128 体', 'n=%s' % st['n'])
+        gn = page.evaluate('() => ({v:+document.getElementById("genN").value,'
+                         ' shown:document.getElementById("genNVal").textContent})')
+        check(abs(gn['v'] - 2.10721) < 0.01 and gn['shown'] == '128',
+              'index.html：#genN 滑块与默认场景一致', 'log10=%s 显示=%s' % (gn['v'], gn['shown']))
     check(st['blen'] == st['n'] * 8, '%s：状态帧 = n×8' % label, 'len=%s' % st['blen'])
     check(st['t'] > 0, '%s：时间在推进（内核在浏览器里跑）' % label, 't=%.4g' % st['t'])
     check(not st['err'], '%s：无错误提示条' % label, st['err'])

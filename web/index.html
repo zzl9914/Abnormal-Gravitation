@@ -379,7 +379,9 @@ $('fExpr').addEventListener('input', () => syncPreset('fPreset', F_PRESETS, $('f
 $('vExpr').addEventListener('input', () => syncPreset('vPreset', V_PRESETS, $('vExpr').value));
 
 // ============================================================== initial bodies
-function defaultBodies(){ // 行星系：中央恒星 + 4 颗不同倾角的行星
+// 行星系：中央恒星 + 4 颗不同倾角的行星
+// （2026-10-17 起不再是开局默认——默认改成 128 体随机云；这里保留作为场景模板）
+function defaultBodies(){
   const bs=[{mass:1000,pos:[0,0,0],vel:[0,0,0]}];
   const R=[2.2,3.6,5.2,7.5], M=[4,7,2,9], inc=[0,0.18,-0.3,0.5];
   for(let i=0;i<4;i++){
@@ -835,6 +837,12 @@ $('trail').oninput=()=>$('trailVal').textContent=$('trail').value;
 // ⚠ 上限必须与内核 kMaxBodies 一致（现为 16384），超限 addBody 会静默失败
 function genNCount(){ return Math.max(1, Math.min(16384, Math.round(Math.pow(10,+$('genN').value)))); }
 $('genN').oninput=()=>$('genNVal').textContent=genNCount();
+// 启动默认场景的体数（也是滑块初始值：#genN 是 log10 刻度）
+const DEFAULT_N = 128;
+function setGenN(n){
+  $('genN').value=Math.log10(n);
+  $('genNVal').textContent=genNCount();   // 滑块吸附 step 后回读，显示真实的那个 N
+}
 $('genR').oninput=()=>$('genRVal').textContent=(+$('genR').value).toFixed(1);
 $('genSpin').oninput=()=>$('genSpinVal').textContent=(+$('genSpin').value).toFixed(2);
 $('genM0').oninput=()=>$('genM0Val').textContent=$('genM0').value;
@@ -873,13 +881,17 @@ document.querySelectorAll('#dimsSeg button').forEach(btn=>{
   };
 });
 
-$('genBtn').onclick=async()=>{
-  const dims=curDims();
-  const cal=await calibrateG();        // 先标定（G + F 采样表），圆速度才能匹配力律
-  initialBodies=makeCloud({
+// 按当前面板参数建云：先标定 G（+ F 采样表）再近平衡初始化。
+// 「生成随机云」按钮与**启动默认场景**共用，保证开局与手动点出来的完全一致。
+async function buildCloud(){
+  const cal=await calibrateG();
+  return makeCloud({
     n:genNCount(), R:+$('genR').value, spin:+$('genSpin').value,
     m0:+$('genM0').value, mMin:0.5, mMax:2
-  },dims,cal);
+  },curDims(),cal);
+}
+$('genBtn').onclick=async()=>{
+  initialBodies=await buildCloud();
   applySetup(true);
   setTimeout(fitView, 600);
 };
@@ -899,7 +911,8 @@ setPlayBtn(true);
   }
   connectStream();
   syncBothPresets();          // 让预设下拉与初始表达式一致
-  initialBodies=defaultBodies();
+  setGenN(DEFAULT_N);         // 默认开局 = 128 体随机云（滑块同步，改体数即可复现）
+  initialBodies=await buildCloud();
   applySetup(false);
   setTimeout(fitView, 800);
   requestAnimationFrame(render);

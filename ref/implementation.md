@@ -412,6 +412,10 @@ acc += mj · w · delta
   **真实半径必须与内核同一公式** `R = (m·Γ(d/2+1)/(ρ·π^(d/2)))^(1/d)`（Γ(2)=1、Γ(2.5)=1.32934），
   `physRadiusFn()` 每帧只造一次（别在 16384 体的循环里读 DOM / 反复 `pow(π,d/2)`）。
   2D 乘 `view.scale`、3D 乘 `f/sz` 换算成像素。
+- **开局默认 = 128 体随机云**（2026-10-17 改）：boot 里先 `setGenN(DEFAULT_N)` 把
+  `#genN` 滑块同步到 128，再走与「生成随机云」按钮共用的 `buildCloud()`
+  （标定 G → `makeCloud` 近平衡初始化）。改体数后点按钮即可复现同样的生成逻辑。
+  旧的 5 体行星系 `defaultBodies()` 保留为场景模板，不再作为开局默认。
 - **genN 范围 1 – 16384**（与内核 `kMaxBodies` 对齐；`getState` 缓冲同样按 16384 体开）。
   ⚠ 改这个上限必须同时改 `kMaxBodies`/`kMaxNodes` 与 `--initial-memory`，否则
   `addBody` 超限返回 −1、静默少建天体。
