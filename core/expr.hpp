@@ -61,6 +61,8 @@ public:
 
     // 只求值
     double value(double x) const { return eval(x).v; }
+    // 只求值且**不**算对偶数导数：力循环热路径专用（语义同上，省掉一半算术）
+    double valueOnly(double x) const;
     // 值 + 精确一阶导数
     Dual eval(double x) const;
 

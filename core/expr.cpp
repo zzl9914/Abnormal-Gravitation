@@ -406,6 +406,26 @@ bool Expr::compile(const char* text, const char* varName) {
 
 // --------------------------------------------------------------------- eval
 
+// ⚠ 整数指数快路径（实测动机）：wasm 侧 gs_pow 是 JS import（Math.pow），
+//   指数不是 ±1/±2 这类小整数时会掉进 fdlibm——N=8192 实测 1/r^12 每步 257 ms，
+//   而 1/r^2 只要 55 ms（同样是一次幂运算），LJ（两个幂项）更是 437 ms。
+//   改成乘法平方链后：① 没有 import 调用；② 力循环后续可做 SIMD128 向量化。
+static inline bool integralExp(double c, int& n){
+    // 不用 floor（gsmath 没有，也不想为一个判断再加一个 wasm import）：
+    // |c| ≤ 64 时 int↔double 往返是精确的，直接比 (double)(int)c == c
+    if (c < -64.0 || c > 64.0) return false;
+    int k = (int)c;
+    if ((double)k != c) return false;
+    n = k;
+    return true;
+}
+static inline double ipowChain(double x, int n){
+    unsigned m = (n < 0) ? (unsigned)(-n) : (unsigned)n;
+    double r = 1.0, b = x;
+    while (m) { if (m & 1u) r *= b; b *= b; m >>= 1; }
+    return (n < 0) ? 1.0 / r : r;
+}
+
 Dual Expr::eval(double x) const {
     Dual st[kMaxExprStack];
     int sp = 0;
@@ -462,10 +482,18 @@ Dual Expr::eval(double x) const {
             case Op::PowC: {
                 Dual a = st[sp - 1];
                 const double c = in.num;
-                double val = gs_pow(a.v, c);
+                double val, dvdx;                 // dvdx = c·x^(c−1)
+                int n;
+                if (integralExp(c, n)) {          // 整数指数：乘法链，不调 gs_pow
+                    val = ipowChain(a.v, n);
+                    dvdx = c * ipowChain(a.v, n - 1);
+                } else {
+                    val = gs_pow(a.v, c);
+                    dvdx = c * gs_pow(a.v, c - 1.0);
+                }
                 double der;
                 if (a.v != 0.0) {
-                    der = c * gs_pow(a.v, c - 1.0) * a.d;
+                    der = dvdx * a.d;
                 } else if (c == 1.0) {
                     der = a.d;
                 } else if (c > 1.0) {
@@ -570,6 +598,62 @@ Dual Expr::eval(double x) const {
                 st[sp - 1].d = a.d / (1.0 + a.v * a.v);
                 break;
             }
+        }
+    }
+    return st[0];
+}
+
+// 只求值的走法：**不算导数**。力循环每一步都要调 F(r)，而 eval() 里一半算术
+// 是在算用不到的 .d（对偶数导数）。语义与 eval(x).v 完全一致（除了整数指数走
+// 同一条乘法链快路径），只有舍入次序的差别。
+double Expr::valueOnly(double x) const {
+    double st[kMaxExprStack];
+    int sp = 0;
+    const double kNaN = __builtin_nan("");
+    for (int i = 0; i < progLen_; i++) {
+        const Insn& in = prog_[i];
+        switch (in.op) {
+            case Op::PushVar:   st[sp++] = x; break;
+            case Op::PushConst: st[sp++] = in.num; break;
+            case Op::Neg:       st[sp - 1] = -st[sp - 1]; break;
+            case Op::Add: { double b = st[sp - 1], a = st[sp - 2]; st[sp - 2] = a + b; sp--; break; }
+            case Op::Sub: { double b = st[sp - 1], a = st[sp - 2]; st[sp - 2] = a - b; sp--; break; }
+            case Op::Mul: { double b = st[sp - 1], a = st[sp - 2]; st[sp - 2] = a * b; sp--; break; }
+            case Op::Div: { double b = st[sp - 1], a = st[sp - 2]; st[sp - 2] = a / b; sp--; break; }
+            case Op::PowC: {
+                int n; double c = in.num;
+                st[sp - 1] = integralExp(c, n) ? ipowChain(st[sp - 1], n) : gs_pow(st[sp - 1], c);
+                break;
+            }
+            case Op::PowGen: {
+                double w = st[sp - 1], a = st[sp - 2];
+                if (a > 0.0) st[sp - 2] = gs_pow(a, w);
+                else if (a == 0.0 && w == 0.0) st[sp - 2] = 1.0;
+                else st[sp - 2] = kNaN;
+                sp--;
+                break;
+            }
+            case Op::Sqrt: {
+                double a = st[sp - 1];
+                st[sp - 1] = (a > 0.0) ? gs_sqrt(a) : (a == 0.0 ? 0.0 : kNaN);
+                break;
+            }
+            case Op::Exp:  st[sp - 1] = gs_exp(st[sp - 1]); break;
+            case Op::Ln: {
+                double a = st[sp - 1];
+                st[sp - 1] = (a > 0.0) ? gs_log(a) : kNaN;
+                break;
+            }
+            case Op::Abs:  st[sp - 1] = gs_fabs(st[sp - 1]); break;
+            case Op::Sgn:  st[sp - 1] = (double)((st[sp - 1] > 0.0) - (st[sp - 1] < 0.0)); break;
+            case Op::Sin:  st[sp - 1] = gs_sin(st[sp - 1]); break;
+            case Op::Cos:  st[sp - 1] = gs_cos(st[sp - 1]); break;
+            case Op::Tan: {
+                double c = gs_cos(st[sp - 1]);
+                st[sp - 1] = (gs_fabs(c) < 1e-300) ? kNaN : gs_tan(st[sp - 1]);
+                break;
+            }
+            case Op::Atan: st[sp - 1] = gs_atan(st[sp - 1]); break;
         }
     }
     return st[0];

@@ -98,7 +98,7 @@ public:
     void setG(double G);
     double g() const { return G_; }
     // 原始力律值 F(r)（不含 G）
-    double forceAt(double r) const { return F_.value(r); }
+    double forceAt(double r) const { return F_.valueOnly(r); }
     // treeMode: 0 = auto（alive >= kTreeThreshold 时用树），1 = 始终直接求和
     void setTree(int treeMode, double theta);
 

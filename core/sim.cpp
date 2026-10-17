@@ -77,7 +77,7 @@ bool Simulation::init(int dims, const char* fExpr, const char* forceExpr) {
     // 力律体检：几个探测距离上必须是有限值（其余极点交给运行时钳位）
     static const double kProbe[3] = {0.5, 1.0, 2.0};
     for (int i = 0; i < 3; i++) {
-        if (!gs_isfinite(F_.value(kProbe[i]))) {
+        if (!gs_isfinite(F_.valueOnly(kProbe[i]))) {
             gs_strcat(err_, kMaxErr, "F(r) 在 r = ");
             gs_strcat_num(err_, kMaxErr, kProbe[i]);
             gs_strcat(err_, kMaxErr, " 处不是有限值");
@@ -95,14 +95,14 @@ bool Simulation::init(int dims, const char* fExpr, const char* forceExpr) {
         fExp_ = p;
     } else {
         // 校验：f(0) == 0 且在采样网格上严格递增
-        if (gs_fabs(f_.value(0.0)) > 1e-9) {
+        if (gs_fabs(f_.valueOnly(0.0)) > 1e-9) {
             gs_strcat(err_, kMaxErr, "f 必须满足 f(0) = 0（否则两点重合时距离不为 0）");
             return false;
         }
         double prev = 0.0;
         for (int i = 0; i < 80; i++) {
             double t = gs_exp(-6.0 * GS_LN10 + 10.0 * GS_LN10 * i / 79.0);  // 1e-6 .. 1e4
-            double v = f_.value(t);
+            double v = f_.valueOnly(t);
             if (!gs_isfinite(v)) {
                 gs_strcat(err_, kMaxErr, "f 在 t = ");
                 gs_strcat_num(err_, kMaxErr, t);
@@ -160,7 +160,7 @@ void Simulation::buildPotentialTable() {
     for (int i = 0; i < N; i++) {
         double l = lmin + dl * i;
         double r = gs_exp(l);
-        double fr = F_.value(r);
+        double fr = F_.valueOnly(r);
         vTabR_[i] = r;
         vTabV_[i] = V;
         vTabF_[i] = gs_isfinite(fr) ? fr : 0.0;
@@ -170,7 +170,7 @@ void Simulation::buildPotentialTable() {
             for (int g = 0; g < 4; g++) {
                 double lg = lm + 0.5 * dl * xg[g];
                 double rg = gs_exp(lg);
-                double fg = F_.value(rg);
+                double fg = F_.valueOnly(rg);
                 if (gs_isfinite(fg)) seg += wg[g] * 0.5 * dl * fg * rg;
             }
             V += seg;
@@ -221,7 +221,7 @@ double Simulation::potentialAt(double r) const {
 // 度量距离 d 处的对势，含核内正则（R = R_i + R_j）
 double Simulation::pairV(double d, double R) const {
     if (R > 0.0 && d < R) {
-        double FR = G_ * F_.value(R);
+        double FR = G_ * F_.valueOnly(R);
         if (!gs_isfinite(FR)) FR = 0.0;
         return potentialAt(R) + FR * (d * d - R * R) / (2.0 * R);
     }
@@ -445,9 +445,9 @@ void Simulation::applyOneSided(int i, const double* posj, double mj, double radj
     const double Rij = bodies_[i].radius + radj;
     double s;
     if (Rij > 0.0 && d < Rij) {
-        s = G_ * F_.value(Rij) * (d / Rij);
+        s = G_ * F_.valueOnly(Rij) * (d / Rij);
     } else {
-        s = G_ * F_.value(d);
+        s = G_ * F_.valueOnly(d);
     }
     if (!gs_isfinite(s)) return;
     if (gs_fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
@@ -661,15 +661,15 @@ double Simulation::invertF(double S) const {
     if (fIsPower_) return gs_pow(S, 1.0 / fExp_);
 
     double lo = 0.0, hi = 1.0;
-    double fhi = f_.value(hi);
+    double fhi = f_.valueOnly(hi);
     int expand = 0;
     while (fhi < S) {
         lo = hi;
         hi *= 2.0;
-        fhi = f_.value(hi);
+        fhi = f_.valueOnly(hi);
         if (++expand > 200) return hi;  // f 有界：距离视为无界
     }
-    if (f_.value(lo) > S) return 0.0;
+    if (f_.valueOnly(lo) > S) return 0.0;
 
     // 带保护的 Newton（导数来自对偶数求值）
     double x = 0.5 * (lo + hi);
@@ -697,7 +697,7 @@ double Simulation::metricDistance(const double* delta) const {
         return S > 0.0 ? gs_pow(S, 1.0 / p) : 0.0;
     }
     double S = 0.0;
-    for (int k = 0; k < dim_; k++) S += f_.value(gs_fabs(delta[k]));
+    for (int k = 0; k < dim_; k++) S += f_.valueOnly(gs_fabs(delta[k]));
     return invertF(S);
 }
 
@@ -776,9 +776,9 @@ void Simulation::computeAccel() {
             // 核外 G·F(d)；核内线性正则 G·F(R)·(d/R)（在 d = R 处力连续）
             double s;
             if (Rij > 0.0 && d < Rij) {
-                s = G_ * F_.value(Rij) * (d / Rij);
+                s = G_ * F_.valueOnly(Rij) * (d / Rij);
             } else {
-                s = G_ * F_.value(d);
+                s = G_ * F_.valueOnly(d);
             }
             if (!gs_isfinite(s)) continue;
             if (gs_fabs(s) > kForceClamp) s = s > 0 ? kForceClamp : -kForceClamp;
