@@ -340,15 +340,16 @@ const F_PRESETS = [
  { v:'t^3',   name:'t^3 · 立方度量 L³（内凹方形单位球）',   dt:5e-4, sub:6 },
  { v:'t^10',  name:'t^10 · 尖锐度量 L¹⁰（近正方形单位球）', dt:5e-4, sub:6 },
 ];
-// ⚠ 预设可以带 `rho`（= log10 ρ，对应 #density 滑块）：短程陡峭的力律（LJ / 1/r¹²）
-//   在默认 ρ=100（半径 ≈0.056）下核内刚度 ω=√(F(R)/R) 可达 1e8，ω·dt≫2 必然指数发散
-//   （实测 R 从 8.16 暴涨到 1e5、E 变 +1e18，树覆盖巨大动态范围还会慢 3×）。
-//   把半径放大 10 倍（ρ=1）即回到稳定区（ω·dt ≈ 0.01）。
+// ⚠ 2026-10-17：预设曾带 `rho` 字段给陡峭力律自动降密度，已移除——
+//   核内刚性现在由「自适应 dt」兜底（setup 前探测 ω，自动把 dt 钳到 ω·dt=1），
+//   不再替用户改密度。
 const V_PRESETS = [
  { v:'r',            name:'r · 胡克弹簧（吸引力随距离线性增大）',        dt:1e-3, sub:4 },
  { v:'1/r',          name:'1/r · 对数势型（平坦旋转曲线）',              dt:1e-3, sub:4 },
  { v:'1/r^2',        name:'1/r² · 牛顿/库仑反比（默认）',                dt:2e-3, sub:4 },
- { v:'1/r^6-1/r^12', name:'1/r⁶ − 1/r¹² · Lennard-Jones（近排斥远吸引）', dt:2e-4, sub:8, rho:0 },
+ // 汤川势 V=−e^(−μr)/r（μ=1）的力律：F = V′ = e^(−r)(1+r)/r²（F>0=吸引，r≫1 时指数屏蔽）
+ { v:'exp(-r)*(1+r)/r^2', name:'e^(−r)(1+r)/r² · 汤川（屏蔽库仑，短程）', dt:2e-3, sub:4 },
+ { v:'1/r^6-1/r^12', name:'1/r⁶ − 1/r¹² · Lennard-Jones（近排斥远吸引）', dt:2e-4, sub:8 },
 ];
 const CUSTOM = '__custom__';   // 表达式不匹配任何预设时的显示态
 for(const [sel, arr] of [['fPreset', F_PRESETS], ['vPreset', V_PRESETS]]){
@@ -386,9 +387,6 @@ $('vPreset').onchange = () => {
   const p = V_PRESETS.find(x => x.v === $('vPreset').value); if(!p) return;
   $('vExpr').value = p.v; syncPreset('vPreset', V_PRESETS, p.v);
   setDtSub(p.dt, p.sub);
-  if(p.rho !== undefined){          // 短程陡峭的力律顺带把密度（半径）调到稳定区
-    $('density').value = p.rho; $('density').oninput();
-  }
   applySetup(true);
 };
 $('fExpr').addEventListener('input', () => syncPreset('fPreset', F_PRESETS, $('fExpr').value));

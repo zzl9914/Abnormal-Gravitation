@@ -79,6 +79,11 @@ def main():
             pick('vPreset', '1/r');       o.backV = $('vExpr').value;
             o.fAfter = $('fPreset').value; o.vAfter = $('vPreset').value;
             o.status = $('applyStatus').textContent;
+            // 汤川势预设（e^(−r)(1+r)/r²，V=−e^(−r)/r）+ 陡峭力律不再自动降密度
+            pick('vPreset', 'exp(-r)*(1+r)/r^2');
+            o.yukawa = $('vExpr').value; o.yukawaStatus = $('applyStatus').textContent;
+            o.densityBefore = $('density').value;
+            pick('vPreset', '1/r^6-1/r^12'); o.ljDensity = $('density').value;
             // 还原默认，后面的建云检查还在默认力律下做
             pick('fPreset', 't^2'); pick('vPreset', '1/r^2');
             return o;
@@ -95,6 +100,11 @@ def main():
         check(abs(sy['backFdt'] - (-3.69897)) <= 0.025, 'index.html：选预设同时套用推荐 dt',
               'log10(dt)=%.4g' % sy['backFdt'])
         check('✓' in sy['status'], 'index.html：预设切换后内核重建成功', sy['status'])
+        check(sy['yukawa'] == 'exp(-r)*(1+r)/r^2' and '✓' in sy['yukawaStatus'],
+              'index.html：汤川势预设可建（V=−e^(−r)/r）', sy['yukawa'])
+        check(sy['ljDensity'] == sy['densityBefore'],
+              'index.html：陡峭力律不再自动降密度（自适应 dt 兜底）',
+              'ρ滑块=%s' % sy['ljDensity'])
         # 显示尺寸分级：N 越大越接近真实半径（真实半径必须与内核公式一致）
         sz = pg.evaluate('''() => {
             const d = +document.querySelector('#dimsSeg button.on').dataset.value;
@@ -166,6 +176,8 @@ def main():
         # 自适应 dt：宽松局面（默认 1/r²）不钳，刚性局面（1/r¹² + ρ=100）自动缩到 ω·dt=1
         wb = pg.evaluate("() => document.getElementById('warnbar').style.display")
         check(wb == 'none', 'index.html：宽松局面不钳 dt（默认场景无报警条）', wb)
+        # 先暂停：16384 体的 tick 会把主线程吃到 ~80%，点击可能超时
+        pg.click('#playBtn')
         pg.evaluate('''() => {
             const $ = id => document.getElementById(id);
             const setExpr = (id, v) => { const el=$(id); el.value=v; el.dispatchEvent(new Event('input')); };
@@ -175,6 +187,7 @@ def main():
             const gn=$('genN'); gn.value=Math.log10(64); gn.dispatchEvent(new Event('input'));
         }''')
         pg.click('#genBtn')
+        pg.click('#playBtn')   # 恢复运行，验证钳制后的演化不发散
         pg.wait_for_timeout(1500)
         ad = pg.evaluate('''() => ({
             warn: document.getElementById('warnbar').style.display,
