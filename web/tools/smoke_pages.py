@@ -88,6 +88,33 @@ def main():
         check(abs(sy['backFdt'] - (-3.69897)) <= 0.025, 'index.html：选预设同时套用推荐 dt',
               'log10(dt)=%.4g' % sy['backFdt'])
         check('✓' in sy['status'], 'index.html：预设切换后内核重建成功', sy['status'])
+        # 显示尺寸分级：N 越大越接近真实半径（真实半径必须与内核公式一致）
+        sz = pg.evaluate('''() => {
+            const d = +document.querySelector('#dimsSeg button.on').dataset.value;
+            const pr = physRadiusFn();
+            return {
+                d: d,
+                r1: pr(1), r8: pr(8),
+                w: [sizeWeight(5), sizeWeight(1000), sizeWeight(2000),
+                    sizeWeight(5000), sizeWeight(12000), sizeWeight(16384)],
+                fl: [sizeFloor(100), sizeFloor(3000), sizeFloor(16384)],
+                gl: [glowWeight(100), glowWeight(2000), glowWeight(5000)]
+            };
+        }''')
+        import math
+        rho = 100.0            # 密度滑块默认 10^2
+        d = sz['d']
+        exp1 = (1.0 * math.gamma(d / 2.0 + 1.0) / (rho * math.pi ** (d / 2.0))) ** (1.0 / d)
+        exp8 = (8.0 * math.gamma(d / 2.0 + 1.0) / (rho * math.pi ** (d / 2.0))) ** (1.0 / d)
+        check(abs(sz['r1'] - exp1) < 1e-9 and abs(sz['r8'] - exp8) < 1e-9,
+              'index.html：真实半径 = (m·Γ(d/2+1)/(ρ·π^(d/2)))^(1/d)（与内核一致）',
+              'd=%d R(1)=%.6g R(8)=%.6g' % (d, sz['r1'], sz['r8']))
+        check(all(sz['w'][i] > sz['w'][i + 1] for i in range(len(sz['w']) - 1)) and sz['w'][0] == 1,
+              'index.html：夸张权重随 N 单调下降（1 → 0.1）', str(sz['w']))
+        check(sz['fl'][0] > sz['fl'][1] > sz['fl'][2] and sz['fl'][2] >= 1.0,
+              'index.html：像素下限随 N 收缩但不小于 1px', str(sz['fl']))
+        check(sz['gl'][0] > sz['gl'][1] > sz['gl'][2] and sz['gl'][2] == 0,
+              'index.html：大 N 时光晕收掉', str(sz['gl']))
         pg.wait_for_timeout(400)
         pg.eval_on_selector('#genN', "el => { el.value = Math.log10(800); el.dispatchEvent(new Event('input')); }")
         pg.click('#genBtn')
