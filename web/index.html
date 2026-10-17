@@ -332,23 +332,45 @@ const V_PRESETS = [
  { v:'1/r^2',        name:'1/r² · 牛顿/库仑反比（默认）',                dt:2e-3, sub:4 },
  { v:'1/r^6-1/r^12', name:'1/r⁶ − 1/r¹² · Lennard-Jones（近排斥远吸引）', dt:2e-4, sub:8 },
 ];
+const CUSTOM = '__custom__';   // 表达式不匹配任何预设时的显示态
 for(const [sel, arr] of [['fPreset', F_PRESETS], ['vPreset', V_PRESETS]]){
   const el = $(sel);
   arr.forEach(p => { const o = document.createElement('option'); o.value = p.v; o.textContent = p.name; el.appendChild(o); });
+  const c = document.createElement('option');
+  c.value = CUSTOM; c.textContent = '自定义（表达式不匹配任何预设）';
+  c.hidden = true;            // 只在表达式确实不等于任何预设时才露出来
+  el.appendChild(c);
 }
-$('vPreset').value = '1/r^2';   // 与输入框默认一致
+// 预设 ↔ 表达式双向同步：手改表达式后，若仍等于某个预设就显示该预设，否则显示「自定义」
+const normExpr = s => String(s || '').replace(/\s+/g, '');
+function syncPreset(selId, arr, expr){
+  const el = $(selId);
+  const hit = arr.find(p => normExpr(p.v) === normExpr(expr));
+  const c = el.options[el.options.length - 1];   // 末尾固定是「自定义」
+  c.hidden = !!hit;
+  el.value = hit ? hit.v : CUSTOM;
+  return hit || null;
+}
+function syncBothPresets(){
+  syncPreset('fPreset', F_PRESETS, $('fExpr').value);
+  syncPreset('vPreset', V_PRESETS, $('vExpr').value);
+}
 function setDtSub(dt, sub){
   $('dt').value = Math.log10(dt); $('dtVal').textContent = dt.toPrecision(2);
   $('sub').value = sub; $('subVal').textContent = sub;
 }
 $('fPreset').onchange = () => {
-  const p = F_PRESETS.find(x => x.v === $('fPreset').value); if(!p) return;
-  $('fExpr').value = p.v; setDtSub(p.dt, p.sub); applySetup(true);
+  const p = F_PRESETS.find(x => x.v === $('fPreset').value); if(!p) return;  // 自定义：不改表达式
+  $('fExpr').value = p.v; syncPreset('fPreset', F_PRESETS, p.v);
+  setDtSub(p.dt, p.sub); applySetup(true);
 };
 $('vPreset').onchange = () => {
   const p = V_PRESETS.find(x => x.v === $('vPreset').value); if(!p) return;
-  $('vExpr').value = p.v; setDtSub(p.dt, p.sub); applySetup(true);
+  $('vExpr').value = p.v; syncPreset('vPreset', V_PRESETS, p.v);
+  setDtSub(p.dt, p.sub); applySetup(true);
 };
+$('fExpr').addEventListener('input', () => syncPreset('fPreset', F_PRESETS, $('fExpr').value));
+$('vExpr').addEventListener('input', () => syncPreset('vPreset', V_PRESETS, $('vExpr').value));
 
 // ============================================================== initial bodies
 function defaultBodies(){ // 行星系：中央恒星 + 4 颗不同倾角的行星
@@ -837,6 +859,7 @@ setPlayBtn(true);
     return;
   }
   connectStream();
+  syncBothPresets();          // 让预设下拉与初始表达式一致
   initialBodies=defaultBodies();
   applySetup(false);
   setTimeout(fitView, 800);

@@ -57,6 +57,38 @@ def main():
         # 主页：点「生成随机云」验证建云 + 标定链路（需要打开设置抽屉）
         pg.click('#settingsToggle')
         pg.wait_for_timeout(200)
+        # 预设 ↔ 表达式双向同步（手改表达式 → 预设跟随；不匹配 → 显示「自定义」）
+        sy = pg.evaluate('''() => {
+            const $ = id => document.getElementById(id);
+            const setExpr = (id, v) => { const el=$(id); el.value=v; el.dispatchEvent(new Event('input')); };
+            const pick = (id, v) => { const el=$(id); el.value=v; el.dispatchEvent(new Event('change')); };
+            const o = {};
+            o.initF = $('fPreset').value; o.initV = $('vPreset').value;
+            setExpr('fExpr', 't^3');      o.matchF = $('fPreset').value;
+            setExpr('vExpr', '1/r^3');    o.customV = $('vPreset').value;
+            o.customShown = !$('vPreset').options[$('vPreset').options.length-1].hidden;
+            setExpr('fExpr', '0.5*t+t^2'); o.customF = $('fPreset').value;
+            pick('fPreset', 't');         o.backF = $('fExpr').value; o.backFdt = +$('dt').value;
+            pick('vPreset', '1/r');       o.backV = $('vExpr').value;
+            o.fAfter = $('fPreset').value; o.vAfter = $('vPreset').value;
+            o.status = $('applyStatus').textContent;
+            // 还原默认，后面的建云检查还在默认力律下做
+            pick('fPreset', 't^2'); pick('vPreset', '1/r^2');
+            return o;
+        }''')
+        check(sy['initF'] == 't^2' and sy['initV'] == '1/r^2',
+              'index.html：启动时预设与表达式一致', 'f=%s F=%s' % (sy['initF'], sy['initV']))
+        check(sy['matchF'] == 't^3', 'index.html：改表达式 → 预设跟随', 'f预设=%s' % sy['matchF'])
+        check(sy['customV'] == '__custom__' and sy['customShown'],
+              'index.html：非预设表达式 → 显示自定义', 'F预设=%s' % sy['customV'])
+        check(sy['customF'] == '__custom__', 'index.html：f 同样支持自定义态', 'f预设=%s' % sy['customF'])
+        check(sy['backF'] == 't' and sy['backV'] == '1/r',
+              'index.html：选预设 → 回写表达式', 'f=%s F=%s' % (sy['backF'], sy['backV']))
+        # dt 滑块 step=0.05，log10(2e-4)=-3.699 会被吸附到 -3.70，容差取半步
+        check(abs(sy['backFdt'] - (-3.69897)) <= 0.025, 'index.html：选预设同时套用推荐 dt',
+              'log10(dt)=%.4g' % sy['backFdt'])
+        check('✓' in sy['status'], 'index.html：预设切换后内核重建成功', sy['status'])
+        pg.wait_for_timeout(400)
         pg.eval_on_selector('#genN', "el => { el.value = Math.log10(800); el.dispatchEvent(new Event('input')); }")
         pg.click('#genBtn')
         pg.wait_for_timeout(2500)
