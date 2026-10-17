@@ -205,8 +205,11 @@ F = 1/r⁶−1/r¹² → V = −1/(5r⁵)+1/(11r¹¹)（Lennard-Jones）。
 的「宇宙力场」），f=t² 时退化为严格守恒。
 
 **核内刚性发散**：物质密度 ρ 很大（→ 半径很小）时，核内线性力的简谐频率  
-ω ~ (F(R)/R)^(1/2) 会超过积分器的可解析范围。Verlet 在 ω·dt > 2 时指数发散  
-（能量爆炸）。UI 默认 ρ=100 时安全；若调大密度，需相应减小 dt。
+ω = (G·m·|F(Rij)|/Rij)^(1/2)（Rij = 两天体半径之和）会超过积分器的可解析范围。  
+Verlet 在 ω·dt > 2 时指数发散（能量爆炸；哪怕只走 1 步也救不回来）。  
+**主页已内置自适应 dt**：dt_eff = min(用户 dt, 1/ω)——设定的 dt 是宽松时的上限；  
+setup 之前先用探针估计 ω（按 F/ρ/维度/半径/质量谱缓存），刚性局面自动缩小 dt 并  
+在警告条中提示，回到宽松力律即解除。把密度调小（半径变大）可提高上限。
 
 **自引力盘的弛豫**：N 体盘通过两体散射把总角动量在质点间重新分配，  
 轨道逐渐变扁（总 L、总 E 不变）。随机云默认近平衡初始化（包围质量圆速度、  
@@ -228,6 +231,7 @@ F = 1/r⁶−1/r¹² → V = −1/(5r⁵)+1/(11r¹¹)（Lennard-Jones）。
 - `Gravity.control(cmd)` — `running / dt / substeps / speed / tree / theta / G / stepOnce`
 - `Gravity.reset()` — 按最近配置重建
 - `Gravity.calibrate({F, r, rs})` → `{g, fs}`：满足 G·F(r)=0.04 的 G，及 F 的采样表
+- `Gravity.probeForce(F, rs)` → F 在各半径处的值（不建主模拟；自适应 dt 的 ω 探测用）
 - `Gravity.analysis()` → `{potR, potV, ball}`：派生 V(r) 采样 + 度量单位球
 - `Gravity.sim` — 快照 `{t, n, e, e0, bodies, running, error, G}`，其中 `bodies` 是  
   **wasm 内存上的 Float64Array 视图**，每体 8 个数：`[m, x, y, z, vx, vy, vz, flags]`  

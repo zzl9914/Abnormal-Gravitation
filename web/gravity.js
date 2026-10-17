@@ -251,6 +251,24 @@
     return out;
   }
 
+  // 探测力律：对表达式 F 在若干半径处求值，返回同长数组（失败项为 NaN）。
+  // 用于自适应 dt 在 setup 之前估计核内刚性 ω —— 不建主模拟、不污染状态。
+  function probeForce(F, rs) {
+    var out = (rs || []).map(function () { return NaN; });
+    if (!I || !rs || !rs.length) return out;
+    var pf = strPtr(F, 0);
+    var pt = strPtr('t^2', 256);
+    var h = I.gs_create_probe(2, pt, pf);
+    if (!h) return out;
+    for (var i = 0; i < rs.length; i++) {
+      if (!(rs[i] > 0) || !(rs[i] < 1e12)) continue;
+      var v = I.gs_force_at(h, rs[i]);
+      if (isFinite(v)) out[i] = v;
+    }
+    I.gs_destroy(h);
+    return out;
+  }
+
   // ------------------------------------------------------------- tick 循环
   // 与旧服务端一致：目标 30 Hz 物理 tick（不是 60），每 tick 步数 = substeps×speed，
   // 并按墙钟预算 0.7×interval 分批下发；渲染由调用方的 rAF 驱动。
@@ -329,6 +347,7 @@
     analysis: analysis,
     calibrate: calibrate,
     forceAt: forceAt,
+    probeForce: probeForce,
     start: start,
     stop: stop,
     refresh: refresh,

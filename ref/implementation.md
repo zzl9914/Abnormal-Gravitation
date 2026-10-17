@@ -419,6 +419,16 @@ acc += mj · w · delta
 - **genN 范围 1 – 16384**（与内核 `kMaxBodies` 对齐；`getState` 缓冲同样按 16384 体开）。
   ⚠ 改这个上限必须同时改 `kMaxBodies`/`kMaxNodes` 与 `--initial-memory`，否则
   `addBody` 超限返回 −1、静默少建天体。
+- **自适应 dt**（`stiffnessOmega / adaptiveDt / showAdaptNote`，2026-10-17 加）：
+  核内正则力是简谐势，ω² = G·m_j·|F(Rij)|/Rij（Rij = 两天体半径之和），
+  ω·dt > 2 时 Verlet 指数发散——**1 步就放大 ~7200 倍，所以必须在 setup 之前夹**。
+  规则：dt_eff = min(用户 dt, 1/ω)，用户 dt 是宽松时的上限，钳到 ω·dt = 1（留 2× 余量）。
+  ω 用 `Gravity.probeForce(F, [标定点, 2·rMed, rMax+rMed])` 在 setup 前探测，
+  G 按自动标定同式 G = 0.04/F(genR/2) 解析得到；配对取 max(质量中位数×中位数, 最重×中位数)
+  （后者覆盖暗物质晕砸盘的情形）。按 (F, ρ, dims, genR, 质量谱) 做 key 缓存，
+  拖 dt 滑块用缓存值，不重复探测。钳制时 warnbar 提示 + dtVal 显示「(自适应)」。
+  ⚠ 订正：旧 stabilityHint 的 ω = √(G·|F(R)|/R) 漏质量项、实测偏小 ~80×，已删除。
+  实测闭环：1/r¹²+ρ=100（ω≈3e6）下 dt=1e-4 炸、1e-8 稳，夹在两者之间。
 
 ---
 

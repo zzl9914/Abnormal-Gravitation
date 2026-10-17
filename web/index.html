@@ -469,41 +469,69 @@ function curCfg(){
 // 直连 wasm 内核：没有 HTTP、没有 SSE，setup/control 都是进程内函数调用
 async function applySetup(showOk){
   const cfg=curCfg();
+  const dtUser=cfg.dt;
+  const omega=stiffnessOmega(cfg, cfg.bodies);   // 探测在 setup 之前：刚性局面 1 步就炸，救不回来
+  const ad=adaptiveDt(dtUser, omega);
+  cfg.dt=ad.dt;                                  // 进内核的是钳过的 dt；滑块保持用户上限
   const res=Gravity.setup(cfg);
   const st=$('applyStatus');
   if(res.ok){
     st.textContent='已重建 ✓';st.className='status ok';
     energies=[]; trails.data=[];
     fetchAnalysis();
-    stabilityHint();
+    showAdaptNote(ad, dtUser);
+    $('dtVal').textContent=ad.clamped ? ad.dt.toPrecision(2)+' (自适应)' : dtUser.toPrecision(2);
   }else{
     st.textContent='✗ '+res.error;st.className='status bad';
     $('warnbar').style.display='none';
   }
   return res.ok;
 }
-// 核内刚性自检：ω = √(G·|F(R)|/R)（R 由密度导出），ω·dt > 2 时 Verlet 必炸。
-// 实测：F=1/r¹² + ρ=100（R≈0.056）→ ω·dt ≈ 1e4，5 步内 R 从 8.16 涨到 1e5、E 翻正。
-function stabilityHint(){
-  const n=sim.n, el=$('warnbar');
-  if(!n){ el.style.display='none'; return; }
+// ============================================================== 自适应 dt
+// Verlet 稳定边界：核内（d < Ri+Rj）线性正则力是简谐势，ω² = G·m_j·|F(Rij)|/Rij
+// （Rij = 两天体半径之和）。ω·dt > 2 指数发散——实测 1/r¹²+ρ=100（R≈0.056）：
+// ω·dt≈1e4，哪怕只走 1 步也放大 ~7200 倍，所以必须在 setup 之前夹。
+// 规则：dt_eff = min(用户 dt, 1/ω)——设定的 dt 是宽松时的上限；
+// 刚性报警局面自动缩到 ω·dt = 1（边界 2 的一半，留 2× 余量），不报警时与原先一致。
+// ⚠ 订正：旧 stabilityHint 的 ω=√(G·|F(R)|/R) 漏了质量项且半径取错，实测偏小 ~80×，已作废。
+// ω 依赖 (F, ρ, dims, genR, 质量谱)，按 key 缓存，拖 dt 滑块不重复探测。
+const omegaCache={key:'', omega:0};
+function physRadiusOf(m, rho, dims){
+  return dims===3 ? Math.cbrt(3*m/(4*Math.PI*rho)) : Math.sqrt(m/(Math.PI*rho));
+}
+function stiffnessOmega(cfg, bodies){
+  const rho=cfg.density, dims=cfg.dims;
+  const ms=(bodies&&bodies.length?bodies:[{mass:1}]).map(b=>b.mass).sort((x,y)=>x-y);
+  const mMed=ms[Math.floor(ms.length/2)]||1, mMax=ms[ms.length-1]||1;
+  const key=[cfg.F, rho, dims, cfg.autoG, mMed.toPrecision(6), mMax.toPrecision(6)].join('|');
+  if(omegaCache.key===key) return omegaCache.omega;
+  let omega=0;
   try{
-    const b=Gravity.sim.bodies;
-    const ms=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/64))) ms.push(b[8*i]);
-    ms.sort((x,y)=>x-y);
-    const m=ms[Math.floor(ms.length/2)] || 1;      // 质量中位数
-    const R=physRadiusFn()(m);
-    const dt=Math.pow(10,+$('dt').value), G=(+Gravity.sim.G>0)?+Gravity.sim.G:1;
-    if(!(R>0)){ el.style.display='none'; return; }
-    const F=Math.abs(Gravity.forceAt(R));
-    const omega=Math.sqrt(G*F/R);
-    const x=omega*dt;
-    if(x>2){
-      el.style.display='block';
-      el.textContent=`⚠ 核内刚性发散风险：ω·dt = ${x.toExponential(1)} ≫ 2（R=${R.toPrecision(3)}，F(R)=${F.toExponential(2)}）`+
-        `——建议 dt < ${(2/omega).toExponential(1)}，或把密度 ρ 调小让半径变大（放大 10 倍半径可降 100×）。`;
-    }else el.style.display='none';
-  }catch(e){ el.style.display='none'; }
+    const rMed=physRadiusOf(mMed,rho,dims), rMax=physRadiusOf(mMax,rho,dims);
+    const rCal=(cfg.autoG>0)?cfg.autoG:5;                // 半半径标定点：G·F(rCal)=0.04
+    const pv=Gravity.probeForce(cfg.F,[rCal, 2*rMed, rMax+rMed]);
+    const G=(cfg.autoG>0 && isFinite(pv[0]) && pv[0]!==0)
+      ? Math.min(1e6,Math.max(1e-6,0.04/pv[0])) : 1;     // 与 setup 的 autoG 标定同式
+    // 两种最坏配对取大：中位数×中位数、最重的（如暗物质晕）×中位数
+    if(isFinite(pv[1])) omega=Math.max(omega, Math.sqrt(G*mMed*Math.abs(pv[1])/(2*rMed)));
+    if(isFinite(pv[2])) omega=Math.max(omega, Math.sqrt(G*mMax*Math.abs(pv[2])/(rMax+rMed)));
+  }catch(e){}
+  omegaCache.key=key; omegaCache.omega=omega;
+  return omega;
+}
+function adaptiveDt(dtUser, omega){
+  if(!(omega>0)||!isFinite(omega)) return {dt:dtUser, clamped:false, omega:omega||0};
+  const lim=1/omega;                                     // ω·dt=1（边界 2 留一半余量）
+  return dtUser>lim ? {dt:lim, clamped:true, omega} : {dt:dtUser, clamped:false, omega};
+}
+function showAdaptNote(ad, dtUser){
+  const el=$('warnbar');
+  if(ad.clamped){
+    el.style.display='block';
+    el.textContent=`⚠ 核内刚性：已自动把 dt ${dtUser.toExponential(1)} → ${ad.dt.toExponential(1)}`+
+      `（ω·dt ${(ad.omega*dtUser).toExponential(1)} → ${(ad.omega*ad.dt).toFixed(1)}）。`+
+      `设定的 dt 只是宽松时的上限；把密度调小让半径变大可解除钳制。`;
+  }else el.style.display='none';
 }
 function fetchAnalysis(){
   try{
@@ -990,9 +1018,11 @@ addEventListener('keydown',e=>{
 });
 
 $('dt').oninput=()=>{
-  const dt=Math.pow(10,+$('dt').value);
-  $('dtVal').textContent=dt.toPrecision(2);
-  control({dt});
+  const dtU=Math.pow(10,+$('dt').value);
+  const ad=adaptiveDt(dtU, omegaCache.omega);   // 用最近一次 setup 缓存的 ω
+  $('dtVal').textContent=ad.clamped ? ad.dt.toPrecision(2)+' (自适应)' : dtU.toPrecision(2);
+  control({dt:ad.dt});
+  showAdaptNote(ad, dtU);
 };
 $('sub').oninput=()=>{$('subVal').textContent=$('sub').value;control({substeps:+$('sub').value});};
 $('speed').onchange=()=>{control({speed:+$('speed').value});};

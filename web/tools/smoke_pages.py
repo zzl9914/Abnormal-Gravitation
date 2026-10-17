@@ -163,6 +163,54 @@ def main():
               '非透明像素=%s' % gl['painted'])
         check(gl['fallback'] is False, 'index.html：无 WebGL 时回退 Canvas 2D（不抛异常）',
               str(gl['fallback']))
+        # 自适应 dt：宽松局面（默认 1/r²）不钳，刚性局面（1/r¹² + ρ=100）自动缩到 ω·dt=1
+        wb = pg.evaluate("() => document.getElementById('warnbar').style.display")
+        check(wb == 'none', 'index.html：宽松局面不钳 dt（默认场景无报警条）', wb)
+        pg.evaluate('''() => {
+            const $ = id => document.getElementById(id);
+            const setExpr = (id, v) => { const el=$(id); el.value=v; el.dispatchEvent(new Event('input')); };
+            setExpr('vExpr', '1/r^12');
+            const de=$('density'); de.value='2'; de.dispatchEvent(new Event('input'));   // ρ=100
+            const dt=$('dt'); dt.value='-2'; dt.dispatchEvent(new Event('input'));        // 用户 dt=1e-2
+            const gn=$('genN'); gn.value=Math.log10(64); gn.dispatchEvent(new Event('input'));
+        }''')
+        pg.click('#genBtn')
+        pg.wait_for_timeout(1500)
+        ad = pg.evaluate('''() => ({
+            warn: document.getElementById('warnbar').style.display,
+            warnText: document.getElementById('warnbar').textContent,
+            dtVal: document.getElementById('dtVal').textContent,
+            omega: omegaCache.omega
+        })''')
+        check(ad['warn'] == 'block' and '自动' in ad['warnText'],
+              'index.html：刚性局面自动缩 dt 并提示', ad['warnText'][:40])
+        check('自适应' in ad['dtVal'], 'index.html：dt 显示为钳后值', ad['dtVal'])
+        check(ad['omega'] > 1e6, 'index.html：ω 按 ω²=G·m·|F(2R)|/(2R) 估计',
+              'ω=%.3g' % ad['omega'])
+        pg.wait_for_timeout(2000)
+        st = pg.evaluate('''() => {
+            const b = Gravity.sim.bodies, n = Gravity.sim.n;
+            let mr = 0;
+            for (let i = 0; i < n; i++) {
+                const r = Math.hypot(b[8*i+1], b[8*i+2], b[8*i+3]);
+                if (r > mr) mr = r;
+            }
+            return { maxR: mr, e: Gravity.sim.e };
+        }''')
+        check(st['maxR'] < 100 and st['e'] == st['e'] and abs(st['e']) < 1e12,
+              'index.html：钳后 1/r¹² 不再刚性发散', 'maxR=%.4g E=%.4g' % (st['maxR'], st['e']))
+        # 还原默认：回到 1/r² 后报警条必须消失（不报警时与原先一致）
+        pg.evaluate('''() => {
+            const el = document.getElementById('vPreset');
+            el.value = '1/r^2'; el.dispatchEvent(new Event('change'));
+        }''')
+        pg.wait_for_timeout(1200)
+        ad2 = pg.evaluate('''() => ({
+            warn: document.getElementById('warnbar').style.display,
+            dtVal: document.getElementById('dtVal').textContent
+        })''')
+        check(ad2['warn'] == 'none' and '自适应' not in ad2['dtVal'],
+              'index.html：回到宽松力律后解除钳制', 'warn=%s dt=%s' % (ad2['warn'], ad2['dtVal']))
         # 暂停 / 单步
         pg.click('#playBtn')
         pg.wait_for_timeout(300)
